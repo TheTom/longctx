@@ -74,14 +74,20 @@ A retrieval-style reranker fine-tuned on appropriate data is on the roadmap. Unt
 
 ## Status
 
-Pre-alpha. APIs may change. Tested against:
+Pre-alpha v0.1.0. APIs may change.
 
-- Qwen2.5-14B-Instruct-1M (best results)
-- Qwen2.5-7B-Instruct (good results, 2.4× faster)
-- Qwen2.5-32B-Instruct (works)
-- Qwen3-Next-80B-A3B-Instruct (works)
+End-to-end validation 2026-05-06 on AMD MI300X with vLLM-served Qwen2.5-14B-Instruct-1M:
+- `longctx.eval.MRCRRunner` ran the default `LongCtxClient` against MRCR v2 8K bin, n=30, and produced **avg_score=0.755, prefix_pass=100%, total=94s**.
+- Reference number from the headline run was 0.760. Library is within 0.005 (sample noise).
+- The library is byte-functionally equivalent to the inline runner used to generate the original benchmark thread.
 
-Models that fail the default prompt format (Mistral, Qwen3) need a different chat template; fix planned.
+Tested generators on MRCR v2 8K bin, 30 samples each:
+- Qwen2.5-14B-Instruct-1M + RAG: **0.755** (default config, matches reference)
+- Qwen2.5-7B-Instruct + RAG: **0.567** (2.4× faster, fits 16GB GPU)
+- Qwen2.5-32B-Instruct + RAG: **0.237** (vanilla 32K, training-data fit limits the result)
+- Qwen3-Next-80B-A3B + RAG: **0.281** (linear-attention hybrid, MoE)
+
+Mistral-7B-Instruct-v0.3 and Qwen3-8B failed with the default Qwen2.5-style template (prefix-first instruction). Templates are provided for both: `longctx.templates.MISTRAL_VERBATIM_TEMPLATE` and `longctx.templates.QWEN3_NO_THINK_TEMPLATE`. Validation against MRCR for these templates is on the roadmap.
 
 ## License
 
