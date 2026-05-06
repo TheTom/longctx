@@ -29,8 +29,8 @@ DEFAULT_SYSTEM_PROMPT = (
     "retrieved from a longer conversation, plus the user's final question. "
     "The user asks for one specific message (e.g. 'the 2nd play about the "
     "fugitive'). Identify which retrieved candidate matches and reproduce "
-    "it verbatim. If the user provides a prefix string to prepend, prepend "
-    "it. Output ONLY the requested message: prefix + verbatim content. "
+    "it verbatim, prepending the prefix string the user provides. "
+    "Output ONLY the requested message: prefix + verbatim content. "
     "No commentary, no analysis."
 )
 
