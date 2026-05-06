@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "longctx"
+version = "0.1.0"
+description = "Open long-context inference stack: retrieval + open weights, no closed parts."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "TheTom"}
+]
+keywords = ["llm", "long-context", "retrieval", "rag", "vllm", "open-weights"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "requests>=2.31",
+    "sentence-transformers>=3.0",
+    "faiss-cpu>=1.7.4",
+]
+
+[project.optional-dependencies]
+serve = [
+    "vllm>=0.7",
+    "torch>=2.4",
+]
+eval = [
+    "pyarrow>=15.0",
+]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+longctx-eval = "longctx.eval.cli:main"
+longctx-rag = "longctx.rag.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/TheTom/longctx"
+Repository = "https://github.com/TheTom/longctx"
+Documentation = "https://github.com/TheTom/longctx#readme"
+
+[tool.setuptools.packages.find]
+include = ["longctx*"]
