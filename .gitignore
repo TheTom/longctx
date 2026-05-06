@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+.venv/
+.env
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.log
+*.json
+!pyproject.toml
+.DS_Store
+.idea/
+.vscode/
