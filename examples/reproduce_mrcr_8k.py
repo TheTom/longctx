@@ -1,4 +1,4 @@
-"""Reproduce the 0.760 result on MRCR v2 8K bin from the open sparse stack thread.
+"""Reproduce the 0.822 result (n=82, mass-validated) on MRCR v2 8K bin.
 
 Prerequisites:
     1. vLLM serving Qwen2.5-14B-Instruct-1M on http://localhost:5050
@@ -30,12 +30,13 @@ def main():
     client = LongCtxClient(model="qwen25-14b")
 
     runner = MRCRRunner(data_dir)
-    summary = runner.run(client, bin_name="8k", n=30, top_k=8)
+    # n=80+ recommended for low-variance result. n=30 has ±0.05 swing.
+    summary = runner.run(client, bin_name="8k", n=80, top_k=8)
 
-    print(f"\nReproduction target: 0.760")
-    print(f"Your run:            {summary.avg_score:.3f}")
-    if summary.avg_score >= 0.70:
-        print("Within 0.06 of reference. Stack is healthy.")
+    print(f"\nReproduction target (n=82, mass-validated): 0.822")
+    print(f"Your run (n={summary.n}):                       {summary.avg_score:.3f}")
+    if summary.avg_score >= 0.75:
+        print("Within typical sample-noise band of reference. Stack is healthy.")
     else:
         print(
             "Score below reference. Common causes:"

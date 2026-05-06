@@ -14,7 +14,7 @@ A small library that bundles the components needed to reach Anthropic-class long
 
 ## Why
 
-A stack of `longctx` defaults running Qwen2.5-14B-Instruct-1M on a single MI300X scored **0.760 on MRCR v2 8K bin**, beating the headline number a $29M-funded closed-weight startup published with their custom subquadratic architecture. The architectural moat narrative wasn't load-bearing for the workload. Retrieval + open weights solve it.
+A stack of `longctx` defaults running Qwen2.5-14B-Instruct-1M on a single MI300X scored **0.822 on MRCR v2 8K bin** (n=82, mass-validated 2026-05-06), beating the headline number a $29M-funded closed-weight startup published with their custom subquadratic architecture. The architectural moat narrative wasn't load-bearing for the workload. Retrieval + open weights solve it.
 
 This library exists so the rest of the open ecosystem can reproduce that result with one `pip install`.
 
@@ -76,18 +76,37 @@ A retrieval-style reranker fine-tuned on appropriate data is on the roadmap. Unt
 
 Pre-alpha v0.1.0. APIs may change.
 
-End-to-end validation 2026-05-06 on AMD MI300X with vLLM-served Qwen2.5-14B-Instruct-1M:
-- `longctx.eval.MRCRRunner` ran the default `LongCtxClient` against MRCR v2 8K bin, n=30, and produced **avg_score=0.755, prefix_pass=100%, total=94s**.
-- Reference number from the headline run was 0.760. Library is within 0.005 (sample noise).
-- The library is byte-functionally equivalent to the inline runner used to generate the original benchmark thread.
+### Headline numbers (mass-validated)
 
-Tested generators on MRCR v2 8K bin, 30 samples each:
-- Qwen2.5-14B-Instruct-1M + RAG: **0.755** (default config, matches reference)
-- Qwen2.5-7B-Instruct + RAG: **0.567** (2.4× faster, fits 16GB GPU)
-- Qwen2.5-32B-Instruct + RAG: **0.237** (vanilla 32K, training-data fit limits the result)
-- Qwen3-Next-80B-A3B + RAG: **0.281** (linear-attention hybrid, MoE)
+End-to-end validation 2026-05-06 on AMD MI300X with vLLM-served Qwen2.5-14B-Instruct-1M, default `LongCtxClient` config (sentence-transformers MiniLM-L6 + faiss top-K=8):
+
+| MRCR v2 8-needle bin | pipeline | n | avg_score | prefix_pass |
+| -------------------- | -------- | -- | --------- | ----------- |
+| 8K  (16K-32K char)   | RAG          | 82 | **0.822** | 100% |
+| 32K (64K-128K char)  | RAG          | 98 | **0.697** |  97% |
+| 64K (128K-256K char) | RAG          | 95 | **0.641** |  98% |
+| 64K (128K-256K char) | chunked-RAG  | 95 | **0.670** |  98% |
+
+Reference baseline: SubQ Inc.'s published MRCR headline = 0.659 (closed-weight, custom subquadratic architecture, $29M funding).
+
+Three of three bins clear the closed-weight headline with the right pipeline. Plain RAG over standard attention is competitive with claimed-state-of-the-art subquadratic architectures on MRCR-style retrieval workloads at every bin we measured.
+
+### Other tested generators (single-run, n=30, not mass-validated)
+
+- Qwen2.5-7B-Instruct + RAG: 0.567 (2.4× faster, fits 16GB GPU)
+- Qwen2.5-32B-Instruct + RAG: 0.237 (vanilla 32K context window, training-data fit limits the result)
+- Qwen3-Next-80B-A3B + RAG: 0.281 (linear-attention hybrid, MoE)
+
+Single-run scores at n=30 have substantial variance (we observed ±0.05 swings between adjacent runs of the same config). Trust the mass-validated numbers above for headline claims.
 
 Mistral-7B-Instruct-v0.3 and Qwen3-8B failed with the default Qwen2.5-style template (prefix-first instruction). Templates are provided for both: `longctx.templates.MISTRAL_VERBATIM_TEMPLATE` and `longctx.templates.QWEN3_NO_THINK_TEMPLATE`. Validation against MRCR for these templates is on the roadmap.
+
+### Reproduce
+
+```bash
+longctx-bench --data-dir /path/to/mrcr/v2 --model qwen2.5-14b-instruct-1m \
+    --bins 8k 32k 64k --n 80 --include-chunked
+```
 
 ## License
 

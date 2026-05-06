@@ -10,9 +10,33 @@ full benchmark reproduction.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Sequence
 
 import numpy as np
+
+from longctx.rag.embed_cache import EmbedCache
+
+
+def _resolve_device(device: str = "auto") -> str:
+    """Pick the best available embedder device.
+
+    `auto` walks: CUDA → MPS (Apple Silicon) → CPU. Explicit device strings
+    are passed through unchanged so callers can force CPU-only for
+    determinism / debugging.
+    """
+    if device != "auto":
+        return device
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+        mps = getattr(torch.backends, "mps", None)
+        if mps is not None and mps.is_available():
+            return "mps"
+    except ImportError:
+        pass
+    return "cpu"
 
 
 @dataclass
@@ -42,18 +66,46 @@ class RetrievalPipeline:
         self,
         embedder_model: str = "sentence-transformers/all-MiniLM-L6-v2",
         reranker_model: str | None = None,
-        device: str = "cpu",
+        device: str = "auto",
+        cache_dir: str | Path | None = "default",
     ) -> None:
+        """Build a retrieval pipeline.
+
+        Args:
+            embedder_model: HF id or path of the bi-encoder
+            reranker_model: optional cross-encoder for two-stage rerank
+            device: "auto" (default — picks CUDA/MPS/CPU), or explicit
+                "cuda" / "mps" / "cpu" to force a specific backend
+            cache_dir: None (disable) | "default" (~/.cache/longctx) |
+                path. Per-chunk content-hash cache; subsequent calls with
+                identical chunks skip embedding entirely. Override with
+                env var LONGCTX_CACHE_DIR.
+        """
         from sentence_transformers import SentenceTransformer
 
-        self._embedder = SentenceTransformer(embedder_model, device=device)
+        resolved = _resolve_device(device)
+        self._device = resolved
+        self._embedder = SentenceTransformer(embedder_model, device=resolved)
         self._reranker = None
         if reranker_model is not None:
             from sentence_transformers import CrossEncoder
 
             self._reranker = CrossEncoder(
-                reranker_model, device=device, max_length=512
+                reranker_model, device=resolved, max_length=512
             )
+        self._cache = EmbedCache(
+            cache_dir=cache_dir, embedder_name=embedder_model,
+        )
+
+    @property
+    def device(self) -> str:
+        """Device the embedder is running on (after auto-resolution)."""
+        return self._device
+
+    @property
+    def cache_enabled(self) -> bool:
+        """True if disk-backed embedding cache is active."""
+        return self._cache.enabled
 
     def retrieve_chunked(
         self,
@@ -91,12 +143,17 @@ class RetrievalPipeline:
         Returns:
             RetrievalResult with indices, candidates, scores
         """
-        char_size = chunk_size * 4
-        char_overlap = chunk_overlap * 4
+        char_size = max(chunk_size * 4, 1)
+        # Clamp overlap so it can't equal or exceed chunk size
+        # (would create an infinite loop where start never advances).
+        char_overlap = max(0, min(chunk_overlap * 4, char_size - 1))
+        stride = char_size - char_overlap
 
         chunks_text: list[str] = []
         chunks_parent: list[int] = []
         for parent_idx, msg in enumerate(candidates):
+            if not msg:
+                continue
             start = 0
             while start < len(msg):
                 end = min(start + char_size, len(msg))
@@ -104,16 +161,15 @@ class RetrievalPipeline:
                 chunks_parent.append(parent_idx)
                 if end == len(msg):
                     break
-                start = end - char_overlap
+                start += stride
 
+        # Query is short and one-shot; never cache it.
         query_emb = self._embedder.encode(
             [query], convert_to_numpy=True, normalize_embeddings=True
         )
-        chunk_embs = self._embedder.encode(
-            chunks_text,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-            batch_size=64,
+        # Chunks are large and often repeated across calls — cache them.
+        chunk_embs = self._cache.encode_with_cache(
+            self._embedder, chunks_text, batch_size=64,
         )
         sims = (chunk_embs @ query_emb.T).flatten()
 
@@ -168,11 +224,8 @@ class RetrievalPipeline:
         query_emb = self._embedder.encode(
             [query], convert_to_numpy=True, normalize_embeddings=True
         )
-        cand_embs = self._embedder.encode(
-            list(candidates),
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-            batch_size=32,
+        cand_embs = self._cache.encode_with_cache(
+            self._embedder, list(candidates), batch_size=32,
         )
         sims = (cand_embs @ query_emb.T).flatten()
 

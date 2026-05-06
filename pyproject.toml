@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "longctx"
-version = "0.1.0"
+version = "0.2.0"
 description = "Open long-context inference stack: retrieval + open weights, no closed parts."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -37,6 +37,7 @@ eval = [
 ]
 dev = [
     "pytest>=8.0",
+    "pytest-cov>=5.0",
     "ruff>=0.5",
 ]
 
@@ -51,3 +52,7 @@ Documentation = "https://github.com/TheTom/longctx#readme"
 
 [tool.setuptools.packages.find]
 include = ["longctx*"]
+
+[tool.pytest.ini_options]
+addopts = "--cov=longctx --cov-fail-under=90"
+testpaths = ["tests"]
