@@ -42,7 +42,7 @@ dev = [
 
 [project.scripts]
 longctx-eval = "longctx.eval.cli:main"
-longctx-rag = "longctx.rag.cli:main"
+longctx-bench = "longctx.eval.bench:main"
 
 [project.urls]
 Homepage = "https://github.com/TheTom/longctx"
