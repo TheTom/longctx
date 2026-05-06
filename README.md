@@ -4,7 +4,7 @@
 
 Open long-context inference stack. Retrieval + open weights, no closed parts.
 
-A small library that bundles the components needed to reach Anthropic-class long-context retrieval performance on a single accessible GPU using only open weights.
+A small library that bundles the components needed to reach frontier-class long-context retrieval performance on a single accessible GPU using only open weights.
 
 ## What it is
 
@@ -16,7 +16,7 @@ A small library that bundles the components needed to reach Anthropic-class long
 
 ## Why
 
-A stack of `longctx` defaults running Qwen2.5-14B-Instruct-1M on a single MI300X scored **0.822 on MRCR v2 8K bin** (n=82, mass-validated 2026-05-06), beating the headline number a $29M-funded closed-weight startup published with their custom subquadratic architecture. The architectural moat narrative wasn't load-bearing for the workload. Retrieval + open weights solve it.
+A stack of `longctx` defaults running Qwen2.5-14B-Instruct-1M on a single MI300X scored **0.822 on MRCR v2 8K bin** (n=82, mass-validated 2026-05-06). The same stack reaches the **1M context bin end-to-end** on commodity open weights — no fine-tuning, no custom architecture, no closed parts. Cross-bin score curve is in [`docs/results.md`](docs/results.md) and continues to be characterized.
 
 This library exists so the rest of the open ecosystem can reproduce that result with one `pip install`.
 
@@ -76,22 +76,22 @@ A retrieval-style reranker fine-tuned on appropriate data is on the roadmap. Unt
 
 ## Status
 
-Pre-alpha v0.1.0. APIs may change.
+Pre-alpha v0.2.0. APIs may change.
 
 ### Headline numbers (mass-validated)
 
-End-to-end validation 2026-05-06 on AMD MI300X with vLLM-served Qwen2.5-14B-Instruct-1M, default `LongCtxClient` config (sentence-transformers MiniLM-L6 + faiss top-K=8):
+End-to-end validation 2026-05-06 on AMD MI300X with vLLM-served Qwen2.5-32B-Instruct, default `LongCtxClient` config (sentence-transformers MiniLM-L6 + faiss top-K=8). Score-curve characterization is ongoing — see [`docs/results.md`](docs/results.md) for live numbers.
 
 | MRCR v2 8-needle bin | pipeline | n | avg_score | prefix_pass |
 | -------------------- | -------- | -- | --------- | ----------- |
 | 8K  (16K-32K char)   | RAG          | 82 | **0.822** | 100% |
 | 32K (64K-128K char)  | RAG          | 98 | **0.697** |  97% |
-| 64K (128K-256K char) | RAG          | 95 | **0.641** |  98% |
+| 64K (128K-256K char) | RAG          | 95 | 0.641 |  98% |
 | 64K (128K-256K char) | chunked-RAG  | 95 | **0.670** |  98% |
+| 1M (2M-5M char)      | RAG          | 30 | 0.440 | 100% |
+| 1M (2M-5M char)      | chunked-RAG  | 30 | 0.409 |  97% |
 
-Reference baseline: SubQ Inc.'s published MRCR headline = 0.659 (closed-weight, custom subquadratic architecture, $29M funding).
-
-Three of three bins clear the closed-weight headline with the right pipeline. Plain RAG over standard attention is competitive with claimed-state-of-the-art subquadratic architectures on MRCR-style retrieval workloads at every bin we measured.
+The 1M bin scores are an in-progress characterization; the score-narrowing campaign (top-K sweeps, layered retrieval, position-aware ordering) is ongoing.
 
 ### Other tested generators (single-run, n=30, not mass-validated)
 
