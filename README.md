@@ -1,5 +1,7 @@
 # longctx
 
+> **🚧 Work in progress.** Pre-alpha. APIs, numbers, and framing will change as the score-narrowing experiments and roadmap items land. Pin a version (`pip install longctx==0.2.0`) if you depend on it. Issues and PRs welcome.
+
 Open long-context inference stack. Retrieval + open weights, no closed parts.
 
 A small library that bundles the components needed to reach Anthropic-class long-context retrieval performance on a single accessible GPU using only open weights.
