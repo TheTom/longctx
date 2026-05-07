@@ -181,6 +181,20 @@ class EvictRetrieveResponse(BaseModel):
     session_total: int  # how many evicted chunks total in this session
 
 
+class EvictDumpResponse(BaseModel):
+    """Coverage-instrumentation dump: full chunk listing for a session.
+
+    Harness use only — lets the 10M PRD scorer measure what fraction of
+    planted-fact token positions fell inside any captured eviction span.
+    Emits token_range + layer + score; text omitted by default (large).
+    """
+    session_id: str
+    session_total: int
+    token_ranges: list[tuple[int, int]]
+    layers: list[int]
+    scores: list[float]
+
+
 @app.post("/evict/write", response_model=EvictWriteResponse)
 async def evict_write(req: EvictWriteRequest) -> EvictWriteResponse:
     """V3 calls this after each eviction round. Persists evicted-span text
@@ -223,6 +237,28 @@ async def evict_retrieve(req: EvictRetrieveRequest) -> EvictRetrieveResponse:
             for c in chunks
         ],
         session_total=total,
+    )
+
+
+@app.get("/evict/dump", response_model=EvictDumpResponse)
+async def evict_dump(session_id: str) -> EvictDumpResponse:
+    """Coverage instrumentation: dump every captured chunk's token_range
+    for a session so the harness can compute fact-span coverage. No
+    semantic ranking, no query — just a flat enumeration."""
+    store = get_eviction_store()
+    with store._lock:  # noqa: SLF001
+        idx = store._sessions.get(session_id)  # noqa: SLF001
+        if idx is None:
+            return EvictDumpResponse(
+                session_id=session_id, session_total=0,
+                token_ranges=[], layers=[], scores=[],
+            )
+        ranges = [tuple(c.token_range) for c in idx.chunks]
+        layers = [int(c.layer) for c in idx.chunks]
+        scores = [float(c.score) for c in idx.chunks]
+    return EvictDumpResponse(
+        session_id=session_id, session_total=len(ranges),
+        token_ranges=ranges, layers=layers, scores=scores,
     )
 
 
