@@ -1,5 +1,58 @@
 # Changelog
 
+## longctx-svc v0.3.0a3 (2026-05-07) — splice budget cap + sidecar leak guards
+
+### Why
+
+Tom's Hermes alpha session at the Qwen3.6-35B-A3B-4bit + vllm-swift +
+turbo4v2 stack hit two real problems in 0.3.0a2:
+
+1. The default 50-line line-window chunker at `top_k=8` produced a
+   ~12K-token splice block per turn. On a 32K-context Hermes session
+   this filled the prompt budget after a few turns and triggered
+   Hermes' compress / retry cascade.
+2. Hermes' aux-provider fan-out (summarizer, vision, tools, mcp) plus
+   client-side timeout retries left the engine queue full of zombie
+   gens that never received cancellation. Memory pressure built up
+   across long sessions.
+
+### Added
+
+- **Splice budget cap.** `Limits.splice_max_chars` (default 16384 chars
+  ≈ 4K tokens). `_format_chunks_block` now truncates the `## Retrieved
+  code context` system block to fit the budget — highest-rank chunks
+  fully kept, later ones truncated or dropped. Same cap logic ships in
+  vllm-swift's `response_rewriter` so embedded-mode consumers get the
+  bound for free.
+- **Cancel-on-disconnect propagation.** When the rewriter sees a
+  `ClientConnectionResetError` mid-stream, it now calls
+  `upstream_resp.close()` so vLLM's `is_disconnected()` check fires
+  and aborts the in-flight generation instead of letting it finish
+  into a void and pin a decode slot.
+- **Shared upstream `aiohttp.ClientSession`.** The rewriter previously
+  spawned a fresh ClientSession per request, leaking connection pools
+  / FDs under fan-out. Now a single bounded `TCPConnector`
+  (`limit=64, enable_cleanup_closed=True`) is reused across requests.
+- **`engine_dirty` diagnostic.** Per-request `[longctx]` stderr line
+  also reports `vmmap --summary` DIRTY size on the EngineCore pid —
+  the macOS private-memory metric. `ps rss` undercounts mmap-shared
+  pages on big inference processes, which is how a 4–5 GB/turn leak
+  hid for hours during the Hermes session that surfaced this work.
+
+### Compat
+
+Everything ships behind the existing flags; defaults preserve 0.3.0a2
+behavior unless tripped. No API changes. 173 longctx-svc tests +
+487 vllm-swift tests still green.
+
+### Pairs with vllm-swift 0.5.1
+
+`vllm-swift[longctx]` extra pinned to `longctx-svc>=0.3.0a3`, so
+`pip install vllm-swift==0.5.1` always pulls a `longctx-svc` that
+includes the splice cap + cancel-on-disconnect.
+
+---
+
 ## v0.2.0 (2026-05-06) — embedding cache + GPU autodetect
 
 ### **Milestone: 1M-context inference reached on open stack**
