@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
 from longctx_svc import __version__
+from longctx_svc.eviction_store import EvictedChunk, get_eviction_store
 from longctx_svc.indexer.builder import build_index
 from longctx_svc.scope.detect import detect_scope
 from longctx_svc.scope.walk import walk_hot_scope, walk_package_scope
@@ -35,6 +36,11 @@ async def _lifespan(app: FastAPI):
                     state = get_state()
                     state.evict_idle_indexes()
                     state.sessions.evict_idle()
+                    # V3 evict-to-vector store (Tier 2): drop sessions
+                    # that haven't been touched in 30 min. Keeps the
+                    # store from leaking memory across long server
+                    # uptimes when V3 sessions never explicitly close.
+                    get_eviction_store().evict_idle()
                 except asyncio.CancelledError:
                     return
                 except Exception:  # noqa: BLE001
@@ -121,6 +127,103 @@ class StatusResponse(BaseModel):
     scopes_total: int
     memory_mb: float
     scopes: list[dict]
+
+
+# ---------------------------------------------------------------------------
+# V3 evict-to-vector — Tier 2 + Tier 3 of the rescue stack.
+# Design doc: TriAttention V3 — 3-Tier Eviction Rescue Architecture (obsidian).
+# ---------------------------------------------------------------------------
+
+
+class EvictWriteChunk(BaseModel):
+    """One evicted span as posted by V3.
+
+    `text` is decoded by the V3 caller (vLLM has the tokenizer); the store
+    deliberately does not ship a tokenizer to keep the surface narrow.
+    """
+    text: str = Field(..., description="Decoded text of the evicted span")
+    token_range: tuple[int, int] = Field(
+        ..., description="(start, end) in the original prompt token-id sequence"
+    )
+    layer: int = Field(..., description="V3 attention layer index that evicted this")
+    score: float = Field(..., description="V3 eviction score at write time")
+
+
+class EvictWriteRequest(BaseModel):
+    session_id: str = Field(..., description="V3 session id; per-session isolated")
+    chunks: list[EvictWriteChunk] = Field(default_factory=list)
+
+
+class EvictWriteResponse(BaseModel):
+    accepted: int
+    session_total: int
+
+
+class EvictRetrieveRequest(BaseModel):
+    session_id: str
+    query: str = Field(..., description="The user's question for this turn")
+    top_k: int = Field(default=8, ge=1, le=64)
+    score_floor: float = Field(
+        default=0.0, ge=0.0, le=1.0,
+        description="Minimum cosine similarity to surface a chunk (0 = no floor)",
+    )
+
+
+class EvictRetrieveChunk(BaseModel):
+    text: str
+    token_range: tuple[int, int]
+    layer: int
+    score: float
+
+
+class EvictRetrieveResponse(BaseModel):
+    chunks: list[EvictRetrieveChunk]
+    session_total: int  # how many evicted chunks total in this session
+
+
+@app.post("/evict/write", response_model=EvictWriteResponse)
+async def evict_write(req: EvictWriteRequest) -> EvictWriteResponse:
+    """V3 calls this after each eviction round. Persists evicted-span text
+    into a per-session vector index for later rehydration."""
+    if not req.chunks:
+        return EvictWriteResponse(accepted=0, session_total=0)
+    store = get_eviction_store()
+    chunks = [
+        EvictedChunk(
+            text=c.text,
+            token_range=c.token_range,
+            layer=int(c.layer),
+            score=float(c.score),
+        )
+        for c in req.chunks
+    ]
+    total = store.write(req.session_id, chunks)
+    return EvictWriteResponse(accepted=len(chunks), session_total=total)
+
+
+@app.post("/evict/retrieve", response_model=EvictRetrieveResponse)
+async def evict_retrieve(req: EvictRetrieveRequest) -> EvictRetrieveResponse:
+    """vLLM prefill hook calls this on each new turn. Returns top-K
+    evicted chunks for the session, ranked by cosine similarity to the
+    current query. Strictly session-isolated."""
+    store = get_eviction_store()
+    chunks = store.retrieve(
+        req.session_id, req.query, top_k=req.top_k,
+        score_floor=req.score_floor,
+    )
+    total = store.stats()["per_session"].get(req.session_id, 0)
+    return EvictRetrieveResponse(
+        chunks=[
+            EvictRetrieveChunk(
+                text=c.text,
+                token_range=c.token_range,
+                layer=c.layer,
+                score=c.score,
+            )
+            for c in chunks
+        ],
+        session_total=total,
+    )
 
 
 def _build_scope_index(state, scope, entry) -> None:
