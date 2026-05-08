@@ -125,6 +125,52 @@ Plumbing (chunk retrieval) is identical across all models. Answer quality depend
 
 ---
 
+## TriAttention rescue mode (V3 eviction → longctx → rehydrate)
+
+longctx isn't only a code-aware retrieval sidecar. It's also the **rescue layer** behind our TriAttention V3 — an independent implementation and minimal hybrid extension of Mao et al., *"TriAttention: Efficient Long Reasoning with Trigonometric KV Compression"* (arXiv:2604.04921, 2026). V3 lives in TheTom/mlx-swift-lm and TheTom/vllm-swift; the hybrid prefix-protect + per-segment-quota policy, the Tier 2 evict-callback, and the Tier 3 rehydrate plumbing are ours. Design write-up: [`turboquant_plus/docs/papers/triattention-v3.md`](https://github.com/TheTom/turboquant_plus/blob/main/docs/papers/triattention-v3.md).
+
+V3 evicts low-salience cells from the KV cache to keep prefill bounded; longctx catches the evicted token spans, indexes them, and serves them back when the next user turn needs them.
+
+V3 alone breaks long-context recall. longctx alone is just retrieval. **The pair is what gets you unbounded effective context with NIAH-passing recall.**
+
+### End-to-end receipt: 256K NIAH on Qwen3.5-2B-4bit (M5 Max)
+
+```
+==== V3+LONGCTX RAMP VIA CHATSESSION ====
+ctx     arm           t1       t2     v3%    rounds  recall  total
+32K     baseline-tq8v4  5.6s   0.0s   0.00%  0       ✓HIT     5.6s
+32K     v3-only         6.8s   0.2s   3.72%  12      ✗miss    6.9s
+32K     v3+longctx      7.7s   0.6s   3.72%  12      ✓HIT     8.3s
+64K     baseline-tq8v4 16.7s   0.0s   0.00%  0       ✓HIT    16.7s
+64K     v3-only        19.5s   0.2s   2.17%  18      ✗miss   19.7s
+64K     v3+longctx     20.9s   0.9s   2.17%  18      ✓HIT    21.8s
+128K    baseline-tq8v4 76.3s   0.0s   0.00%  0       ✓HIT    76.3s
+128K    v3-only        66.9s   0.8s   1.42%  24      ✗miss   67.6s
+128K    v3+longctx     69.5s   1.3s   1.42%  24      ✓HIT    70.9s
+256K    baseline-tq8v4 186.7s  0.0s   0.00%  0       ✓HIT   186.7s
+256K    v3-only        220.9s  1.0s   1.32%  30      ✗miss  221.9s
+256K    v3+longctx     226.9s  2.4s   1.32%  30      ✓HIT   229.3s
+```
+
+V3+longctx ✓HIT every rung 32K → 256K. V3-only ✗miss every rung. The V3+longctx overhead vs single-turn baseline is ~22% at 256K (229s vs 187s), and what you buy is unbounded effective context plus correctness on long-context retrieval. Standalone confirmation at 256K showed longctx-svc ingested 19,427 evicted text chunks during turn 1's prefill before the question's rehydrate fired on turn 2.
+
+### How it wires together
+
+1. Inference engine (mlx-swift-lm or vllm-swift) loads model with `VLLM_TRIATT_ENABLED=1` and `LONGCTX_ENDPOINT=http://127.0.0.1:5054`.
+2. V3 fires per-token eviction during prefill. Each eviction round: decoded token IDs → `POST /evict/write` on longctx-svc.
+3. longctx-svc embeds the chunks (MiniLM by default) and indexes them in a per-session faiss store.
+4. Next user turn: `ChatSession`'s auto-Tier-3 hook fires `rescue.rehydratePrompt(query: <user_msg>)` → `POST /evict/retrieve` on longctx-svc → top-K relevant chunks → prepended as a system message → that turn's prefill sees the recovered context.
+5. Repeat. Effective context is bounded only by longctx's index size, not GPU memory.
+
+The rescue path **only auto-fires through `ChatSession`**. Bare `container.generate()` will not rescue. This is documented in mlx-swift-lm's README under "TriAttention V3 + longctx (long-context rescue)".
+
+### Source
+
+Test harness: [`mlx-swift-lm/Tests/Benchmarks/V3ChatSessionRamp.swift`](https://github.com/TheTom/mlx-swift-lm/blob/main/Tests/Benchmarks/V3ChatSessionRamp.swift)
+Findings doc (M5 Max): receipts cover V3 default-rate, full ramp 32K → 256K, and the ChatSession rehydrate path.
+
+---
+
 ## Features (v0.3.0–v0.3.3, all in)
 
 | PRD ref | Feature | Status |
