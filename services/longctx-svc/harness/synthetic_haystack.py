@@ -286,6 +286,147 @@ def build_haystack(
     return full_text, planted
 
 
+def build_haystack_with_tasks(
+    target_tokens: int,
+    tasks: list,                    # list[harness.tasks.TaskInstance]
+    tokenizer: Any,
+    seed: int = 42,
+    distribute: str = "spread",     # "spread" places spans of one task at distant positions
+):
+    """Build a haystack and embed each task's evidence spans across it.
+
+    Returns (full_text, [TaskInstance with actual_token_pos filled in]).
+
+    `distribute="spread"` places the K spans of a single multi-span task
+    at K evenly-spaced positions across the haystack — this is what
+    forces multi-hop / aggregation / temporal tasks to actually require
+    long-range reasoning. With "spread", a 3-hop chain has spans at
+    positions ~0%, ~50%, ~100% of the document.
+
+    `distribute="local"` clusters all spans of a single task near each
+    other — useful as a positive control (retrieval should easily
+    surface all of a task's spans).
+    """
+    rng = random.Random(seed)
+
+    # Total span count + slot allocation
+    all_spans: list[tuple[object, object]] = []  # (TaskInstance, EvidenceSpan)
+    for t in tasks:
+        for s in t.evidence_spans:
+            all_spans.append((t, s))
+    n_total = len(all_spans)
+    if n_total == 0:
+        raise ValueError("No spans to embed — tasks list was empty")
+
+    # For each task, assign target token positions.
+    # spread: span_i of task_t goes to position floor((task_idx + i/n_t) / n_total * target)
+    if distribute == "spread":
+        for task_idx, t in enumerate(tasks):
+            k = len(t.evidence_spans)
+            if k == 1:
+                # Single-span task: pick a uniform random position in the
+                # task's allocated band [task_idx/n_tasks, (task_idx+1)/n_tasks)
+                lo = int(task_idx / max(1, len(tasks)) * target_tokens)
+                hi = int((task_idx + 1) / max(1, len(tasks)) * target_tokens)
+                t.evidence_spans[0].target_token_pos = rng.randint(lo, max(lo, hi - 1))
+            else:
+                # Multi-span: spread across the WHOLE document, not just the
+                # task's band. This is what forces long-range reasoning.
+                for i, s in enumerate(t.evidence_spans):
+                    # Add a small per-task jitter so different tasks don't
+                    # collide at exactly the same position.
+                    base = int(i / (k - 1) * (target_tokens - 1)) if k > 1 else 0
+                    jitter = rng.randint(0, max(1, target_tokens // 200))
+                    s.target_token_pos = min(target_tokens - 1, base + jitter)
+    elif distribute == "local":
+        # Each task's spans cluster in a small band.
+        for task_idx, t in enumerate(tasks):
+            band_lo = int(task_idx / max(1, len(tasks)) * target_tokens)
+            band_hi = int((task_idx + 1) / max(1, len(tasks)) * target_tokens)
+            for s in t.evidence_spans:
+                s.target_token_pos = rng.randint(band_lo, max(band_lo, band_hi - 1))
+    else:
+        raise ValueError(f"unknown distribute: {distribute}")
+
+    # Sort all spans by their target_token_pos for in-order embedding.
+    flat_spans = [(t, s, s.target_token_pos)
+                  for t in tasks for s in t.evidence_spans]
+    flat_spans.sort(key=lambda x: x[2])
+
+    # Pre-encode each span's sentence to know its token cost (close enough
+    # — offset_mapping pin will reconcile later).
+    span_token_lens = {
+        s.evidence_id: len(tokenizer.encode(s.text, add_special_tokens=False))
+        for _, s, _ in flat_spans
+    }
+
+    parts: list[str] = []
+    cur_tokens = 0
+    cur_chars = 0
+    span_iter = iter(flat_spans)
+    next_span = next(span_iter, None)
+    # Track each span's actual char position for offset_mapping pin.
+    span_char_pos: dict[str, int] = {}
+
+    CHUNK_SENTENCES = 16
+
+    def _new_chunk() -> tuple[str, int]:
+        sents = [_filler_sentence(rng) for _ in range(CHUNK_SENTENCES)]
+        text = " ".join(sents) + " "
+        n_tok = len(tokenizer.encode(text, add_special_tokens=False))
+        return text, n_tok
+
+    while cur_tokens < target_tokens or next_span is not None:
+        if (next_span is not None
+                and cur_tokens >= next_span[2]):
+            t, s, _ = next_span
+            sentence = s.text + " "
+            parts.append(sentence)
+            span_char_pos[s.evidence_id] = cur_chars
+            cur_chars += len(sentence)
+            cur_tokens += span_token_lens[s.evidence_id]
+            next_span = next(span_iter, None)
+            continue
+        if cur_tokens >= target_tokens:
+            # All remaining spans in the leftover bin
+            if next_span is None:
+                break
+            # Force-emit the rest at the tail
+            t, s, _ = next_span
+            sentence = s.text + " "
+            parts.append(sentence)
+            span_char_pos[s.evidence_id] = cur_chars
+            cur_chars += len(sentence)
+            cur_tokens += span_token_lens[s.evidence_id]
+            next_span = next(span_iter, None)
+            continue
+        chunk_text, chunk_tokens = _new_chunk()
+        parts.append(chunk_text)
+        cur_chars += len(chunk_text)
+        cur_tokens += chunk_tokens
+
+    full_text = "".join(parts)
+
+    # Reconcile actual_token_pos via offset_mapping
+    encoded = tokenizer(
+        full_text, return_offsets_mapping=True,
+        add_special_tokens=False,
+    )
+    offsets = encoded["offset_mapping"]
+    import bisect
+    char_starts = [s for (s, _) in offsets]
+
+    for t in tasks:
+        for s in t.evidence_spans:
+            char_pos = span_char_pos.get(s.evidence_id)
+            if char_pos is None:
+                continue
+            idx = bisect.bisect_left(char_starts, char_pos)
+            s.actual_token_pos = idx
+
+    return full_text, tasks
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tokens", type=int, required=True,
