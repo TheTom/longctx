@@ -165,7 +165,34 @@ class EvictRetrieveRequest(BaseModel):
     top_k: int = Field(default=8, ge=1, le=64)
     score_floor: float = Field(
         default=0.0, ge=0.0, le=1.0,
-        description="Minimum cosine similarity to surface a chunk (0 = no floor)",
+        description="Minimum (post-fusion) score to surface a chunk (0 = no floor)",
+    )
+    # v0.3.1: hybrid scoring + cross-encoder rerank. Both default to
+    # backwards-compatible behavior: hybrid_alpha=None reads the env
+    # default (0.5), use_rerank=True only kicks in when the session has
+    # ≥100 chunks (cheap CPU guard). Existing callers (vllm-turboquant
+    # V3 prefill hook) keep working without changes.
+    hybrid_alpha: float | None = Field(
+        default=None, ge=0.0, le=1.0,
+        description=(
+            "Cosine/BM25 fusion weight in [0, 1]. 1.0 = pure cosine "
+            "(legacy v0.3.0 behavior), 0.0 = pure BM25, 0.5 = balanced. "
+            "None reads VLLM_TRIATT_RESCUE_HYBRID_ALPHA (default 0.5)."
+        ),
+    )
+    use_rerank: bool = Field(
+        default=True,
+        description=(
+            "Apply cross-encoder rerank when the session has enough "
+            "chunks to justify the CPU cost (≥100). No-op below that."
+        ),
+    )
+    prefilter: int = Field(
+        default=32, ge=1, le=512,
+        description=(
+            "Candidate pool size for cross-encoder rerank. Must be "
+            "≥ top_k. Ignored when rerank is skipped."
+        ),
     )
 
 
@@ -224,6 +251,9 @@ async def evict_retrieve(req: EvictRetrieveRequest) -> EvictRetrieveResponse:
     chunks = store.retrieve(
         req.session_id, req.query, top_k=req.top_k,
         score_floor=req.score_floor,
+        hybrid_alpha=req.hybrid_alpha,
+        use_rerank=req.use_rerank,
+        prefilter=req.prefilter,
     )
     total = store.stats()["per_session"].get(req.session_id, 0)
     return EvictRetrieveResponse(

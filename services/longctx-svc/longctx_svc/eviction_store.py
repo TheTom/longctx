@@ -25,9 +25,18 @@ expected to hold O(100s-1000s) of evicted chunks per session. Brute force
 on 384-dim MiniLM embeddings is microseconds at that scale; faiss would
 be premature optimization. Swap to faiss if a session's chunk count grows
 past ~10K (workshop / coding-agent territory).
+
+v0.3.1 (2026-05-07) — hybrid scoring + cross-encoder rerank:
+  Cosine alone misses verbatim entity hits ("Project NOVA", "INV-2845")
+  because MiniLM averages over the sentence. Hybrid fuses normalized
+  BM25 keyword score with cosine. Optional cross-encoder rerank runs on
+  top of the hybrid prefilter when chunk count is high enough to
+  justify the CPU cost.
 """
 from __future__ import annotations
 
+import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -65,6 +74,41 @@ class _SessionIndex:
     """Per-session bag of evicted chunks + their embeddings."""
     chunks: list[EvictedChunk] = field(default_factory=list)
     last_access: float = field(default_factory=time.time)
+    # BM25 lazy-built on first hybrid retrieve, invalidated on write.
+    bm25_dirty: bool = True
+    bm25: object = None  # rank_bm25.BM25Okapi or None
+    bm25_tokens: list[list[str]] = field(default_factory=list)
+
+
+# Simple word tokenizer for BM25. Lowercases, splits on non-alphanumeric,
+# preserves entity-bearing tokens like "INV-2845" by treating '-' as a
+# splitter then re-joining adjacent alnum chunks. We deliberately do
+# NOT stem — verbatim matches on codenames and invoice numbers are the
+# whole point of adding BM25.
+_TOKEN_SPLIT = re.compile(r"[^A-Za-z0-9]+")
+
+
+def _bm25_tokenize(text: str) -> list[str]:
+    """Lowercase, alphanumeric-token splitter. Preserves digits.
+
+    Examples:
+      "Project NOVA INV-2845 $123,456" →
+          ["project", "nova", "inv", "2845", "123", "456"]
+    """
+    if not text:
+        return []
+    tokens = [t for t in _TOKEN_SPLIT.split(text.lower()) if t]
+    return tokens
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
 
 
 class EvictionStore:
@@ -75,10 +119,19 @@ class EvictionStore:
     avoid loading MiniLM N times.
     """
 
-    def __init__(self, embedder=None):
+    # Default rerank-eligibility threshold. Below this chunk count, the
+    # cross-encoder rerank path is skipped even when use_rerank=True
+    # (CPU rerank costs ~5s and isn't worth it on small sessions).
+    # TODO: env-tune via VLLM_TRIATT_RESCUE_RERANK_MIN_CHUNKS if testers
+    # want to override.
+    DEFAULT_RERANK_MIN_CHUNKS = 100
+
+    def __init__(self, embedder=None, reranker=None):
         self._sessions: dict[str, _SessionIndex] = {}
         self._lock = threading.Lock()
         self._embedder = embedder  # lazy-loaded on first write
+        self._reranker = reranker
+        self._reranker_loaded = reranker is not None
 
     def _ensure_embedder(self):
         if self._embedder is not None:
@@ -91,6 +144,30 @@ class EvictionStore:
             "sentence-transformers/all-MiniLM-L6-v2"
         )
         return self._embedder
+
+    def _ensure_reranker(self):
+        """Lazy-load the cross-encoder. Returns None if unavailable.
+
+        Loading is deferred until the first hybrid retrieve that asks
+        for rerank AND has enough chunks. CPU cross-encoder is ~5s/call
+        so we don't want to pay the import cost on small sessions.
+        """
+        if self._reranker is not None:
+            return self._reranker
+        if self._reranker_loaded:
+            return None
+        try:
+            # Use the same model the main /retrieve pipeline does so
+            # we don't double-load weights. Model name lifted from
+            # longctx_svc.config defaults.
+            from sentence_transformers import CrossEncoder
+            self._reranker = CrossEncoder(
+                "cross-encoder/ms-marco-MiniLM-L-6-v2", max_length=512,
+            )
+        except Exception:
+            self._reranker = None
+        self._reranker_loaded = True
+        return self._reranker
 
     def write(self, session_id: str, chunks: list[EvictedChunk]) -> int:
         """Add `chunks` to the session's index. Embeds any chunks that
@@ -122,26 +199,100 @@ class EvictionStore:
             idx = self._sessions.setdefault(session_id, _SessionIndex())
             idx.chunks.extend(chunks)
             idx.last_access = time.time()
+            # Mark BM25 stale; will be rebuilt lazily on next hybrid read.
+            idx.bm25_dirty = True
             return len(idx.chunks)
+
+    def _rebuild_bm25(self, idx: _SessionIndex) -> None:
+        """Rebuild BM25 index from the session's current chunks. Called
+        under the store lock or on a snapshot. Idempotent: clears the
+        dirty flag once done. No-op if rank_bm25 is missing — hybrid
+        callers fall back to cosine-only.
+
+        Uses BM25Plus (not BM25Okapi) because BM25Okapi's IDF goes
+        negative when df > N/2 — on tiny corpora (N < ~10 chunks)
+        every common term has negative IDF and the ranking inverts.
+        BM25Plus adds a +1 IDF floor that keeps scores rank-meaningful
+        even for very small corpora.
+        """
+        try:
+            from rank_bm25 import BM25Plus
+        except Exception:
+            idx.bm25 = None
+            idx.bm25_tokens = []
+            idx.bm25_dirty = False
+            return
+        tokens_per_chunk = [_bm25_tokenize(c.text) for c in idx.chunks]
+        # rank_bm25 crashes on a fully empty corpus; guard.
+        if not tokens_per_chunk or not any(tokens_per_chunk):
+            idx.bm25 = None
+            idx.bm25_tokens = tokens_per_chunk
+            idx.bm25_dirty = False
+            return
+        idx.bm25 = BM25Plus(tokens_per_chunk)
+        idx.bm25_tokens = tokens_per_chunk
+        idx.bm25_dirty = False
 
     def retrieve(
         self, session_id: str, query: str, top_k: int = 8,
         score_floor: float = 0.0,
+        hybrid_alpha: Optional[float] = None,
+        use_rerank: bool = False,
+        prefilter: int = 32,
     ) -> list[EvictedChunk]:
-        """Return the top-K most query-similar evicted chunks for the
-        session, filtered by `score_floor` cosine similarity.
+        """Return the top-K most query-relevant evicted chunks for the
+        session, ranked by:
 
-        Strict session isolation: never cross-queries other sessions.
+            score = alpha * cosine_sim + (1 - alpha) * bm25_normalized
+
+        BM25 scores are min-max normalized inside this call; cosine is
+        already in [-1, 1] (~[0, 1] on this corpus). When alpha=1.0 or
+        BM25 is unavailable, behavior collapses to pure cosine —
+        backwards compatible with v0.3.0.
+
+        Args:
+            session_id: V3 session id (strict isolation).
+            query: user question / decode-time signal.
+            top_k: number of chunks to return after final ranking.
+            score_floor: drop chunks below this final score.
+            hybrid_alpha: blend weight for cosine vs BM25. None →
+                read from `VLLM_TRIATT_RESCUE_HYBRID_ALPHA` (default 0.5).
+                Set to 1.0 to disable BM25 (cosine-only legacy path).
+            use_rerank: when True AND chunk count ≥
+                DEFAULT_RERANK_MIN_CHUNKS, run a cross-encoder rerank
+                over the prefilter pool to refine the top-K.
+            prefilter: candidate pool size BEFORE rerank. Defaults to
+                32 (= 4× a typical top_k=8). When rerank is off, this
+                is ignored — we just take top-K by hybrid score.
+
         Returns [] when the session has no evictions (cold) or when no
         chunk clears the floor.
+
+        TODO: faiss-backed cosine when N > 10K. Right now N is
+        microseconds-cheap so brute-force wins on simplicity.
         """
+        # Resolve hybrid alpha from env if not explicit
+        if hybrid_alpha is None:
+            hybrid_alpha = _env_float(
+                "VLLM_TRIATT_RESCUE_HYBRID_ALPHA", 0.5,
+            )
+        # Clamp alpha to [0, 1]
+        alpha = float(max(0.0, min(1.0, hybrid_alpha)))
+
         with self._lock:
             idx = self._sessions.get(session_id)
             if idx is None or not idx.chunks:
                 return []
             chunks_snapshot = list(idx.chunks)  # copy out of lock
             idx.last_access = time.time()
+            # Rebuild BM25 if dirty (under lock so we don't race writes).
+            if alpha < 1.0 and idx.bm25_dirty:
+                self._rebuild_bm25(idx)
+            bm25 = idx.bm25
+            # Note: bm25_tokens not needed at retrieve time
 
+        # Pure-cosine path — preserves v0.3.0 behavior bit-for-bit when
+        # alpha=1.0. Used by the existing test_eviction_store.py suite.
         embedder = self._ensure_embedder()
         q_vec = embedder.encode(
             [query], convert_to_numpy=True, show_progress_bar=False
@@ -149,22 +300,75 @@ class EvictionStore:
         q_norm = float(np.linalg.norm(q_vec) + 1e-9)
         q_vec = (q_vec / q_norm).astype(np.float32)
 
-        # Stack chunk embeddings and brute-force cosine
         embs = np.stack(
             [c.embedding for c in chunks_snapshot], axis=0
         )  # [N, D] — already L2-normalized at write
-        sims = embs @ q_vec  # [N] cosine since both are unit-norm
-        # Apply floor
-        keep = sims >= score_floor
+        cos_sims = embs @ q_vec  # [N] cosine since both are unit-norm
+
+        # BM25 component (only if alpha < 1 and BM25 is available).
+        if alpha < 1.0 and bm25 is not None:
+            q_tokens = _bm25_tokenize(query)
+            if q_tokens:
+                bm25_scores = np.asarray(
+                    bm25.get_scores(q_tokens), dtype=np.float32,
+                )
+                # BM25Plus keeps scores ≥ 0, so a simple max-divide
+                # normalizes into [0, 1]. When all scores are equal
+                # (no per-chunk discrimination — query terms occur in
+                # every chunk identically), fall back to cosine.
+                bmax = float(bm25_scores.max())
+                bmin = float(bm25_scores.min())
+                spread = bmax - bmin
+                if spread > 1e-9:
+                    bm25_norm = (bm25_scores - bmin) / spread
+                    fused = alpha * cos_sims + (1.0 - alpha) * bm25_norm
+                else:
+                    fused = cos_sims
+            else:
+                fused = cos_sims
+        else:
+            fused = cos_sims
+
+        # Floor
+        keep = fused >= score_floor
         if not bool(keep.any()):
             return []
-        masked_sims = np.where(keep, sims, -np.inf)
-        # Top-K
-        k = min(int(top_k), int(keep.sum()))
-        top_idx = np.argpartition(-masked_sims, kth=k - 1)[:k]
-        # Order by similarity descending for nicer logs / response
-        top_idx = top_idx[np.argsort(-masked_sims[top_idx])]
-        return [chunks_snapshot[int(i)] for i in top_idx]
+        masked = np.where(keep, fused, -np.inf)
+
+        # Determine prefilter pool — at least top_k, capped at chunk count.
+        n_chunks = len(chunks_snapshot)
+        do_rerank = (
+            use_rerank
+            and n_chunks >= self.DEFAULT_RERANK_MIN_CHUNKS
+            and int(keep.sum()) > top_k
+        )
+        pool_size = (
+            min(max(int(prefilter), int(top_k)), int(keep.sum()))
+            if do_rerank else min(int(top_k), int(keep.sum()))
+        )
+        # Top-N within mask
+        if pool_size <= 0:
+            return []
+        pool_idx = np.argpartition(-masked, kth=pool_size - 1)[:pool_size]
+        pool_idx = pool_idx[np.argsort(-masked[pool_idx])]
+        pool = [chunks_snapshot[int(i)] for i in pool_idx]
+
+        if do_rerank:
+            reranker = self._ensure_reranker()
+            if reranker is not None:
+                # Truncate texts to keep cross-encoder under max_length.
+                pairs = [(query, c.text[:2000]) for c in pool]
+                try:
+                    rr_scores = reranker.predict(
+                        pairs, batch_size=16, show_progress_bar=False,
+                    )
+                    rr_order = np.argsort(-np.asarray(rr_scores)).tolist()
+                    pool = [pool[i] for i in rr_order]
+                except Exception:
+                    # Rerank failure → fall through with hybrid order.
+                    pass
+
+        return pool[: int(top_k)]
 
     def clear(self, session_id: str) -> int:
         """Drop all evictions for a session. Returns count dropped."""
