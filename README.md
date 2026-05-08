@@ -120,8 +120,8 @@ Plumbing (chunk retrieval) is identical across all models. Answer quality depend
 - See [`benchmarks/latency.py`](services/longctx-svc/benchmarks/latency.py) and `latency_results.json`.
 
 **Test coverage**
-- `longctx-svc`: **173 tests, all green** — covers scope detection, walk + .gitignore, chunker (line-window + tree-sitter), indexer, session manager, async kickoff, idle eviction, disk cache, file watcher, OpenAI-compat proxy, sidecar spawn + port-collision, cross-fork integration, Sarah's full PRD §7 journey, auto-promotion (path-based + confidence-driven), workspace `ws:` mode.
-- `vllm-swift`: 487/487 (after `--retrieval-endpoint` and `--enable-longctx` landed)
+- `longctx-svc`: **210 tests, all green** — covers scope detection, walk + .gitignore, chunker (line-window + tree-sitter), indexer, session manager, async kickoff, idle eviction, disk cache, file watcher, OpenAI-compat proxy, sidecar spawn + port-collision, cross-fork integration, Sarah's full PRD §7 journey, auto-promotion (path-based + confidence-driven), workspace `ws:` mode, V3 evict/rehydrate roundtrip.
+- `vllm-swift`: 510 tests collected, full suite green (current main; v0.6.0)
 
 ---
 
