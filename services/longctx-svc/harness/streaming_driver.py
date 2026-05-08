@@ -5,13 +5,24 @@ endpoint. Each turn appends a chunk of the haystack to the
 conversation. After the haystack is fully fed, asks the question
 battery and scores answers.
 
-Two modes:
+Three modes:
   "single_long" — submit the entire haystack + all questions in
                   ONE chat completion. Fails outside max_model_len.
                   Useful for the fp16 baseline arm.
-  "streaming"   — chunked turns, optionally with prefix caching ON
-                  so prior content is preserved across turns. The
-                  PRD's primary mode.
+  "streaming"   — chunked turns, the cumulative-history mode. By
+                  turn N the request carries N×turn_tokens tokens,
+                  so this requires --max-model-len ≥ haystack size
+                  and cannot demonstrate the "32K active + longctx
+                  external memory" PRD claim today.
+  "compact"     — the today-feasible 10M-effective-context mode.
+                  Phase 1 writes haystack chunks directly to longctx-
+                  svc /evict/write, indexed under --session_id. Phase
+                  2 asks each question as a fresh single-message chat;
+                  vLLM's Tier 3 rehydrate prepends rescued chunks
+                  server-side. Per-request active prompt stays ≤32K
+                  regardless of haystack size. Bypasses V3 entirely
+                  — the receipt is "longctx external memory at scale,"
+                  not "V3 eviction-and-recovery."
 
 Key design choices:
   * Per-turn chunk size tunable (default 8192 tokens) — must be
@@ -66,6 +77,7 @@ def _post_chat(
     endpoint: str, model: str, messages: list[dict],
     max_tokens: int = 64, temperature: float = 0.0,
     timeout: float = 600.0,
+    session_id: Optional[str] = None,
 ) -> dict:
     url = endpoint.rstrip("/") + "/chat/completions"
     body = {
@@ -74,7 +86,12 @@ def _post_chat(
         "max_tokens": max_tokens,
         "temperature": temperature,
     }
-    r = requests.post(url, json=body, timeout=timeout)
+    headers = {}
+    if session_id:
+        headers["X-Longctx-Session"] = session_id
+    r = requests.post(
+        url, json=body, headers=headers or None, timeout=timeout,
+    )
     r.raise_for_status()
     return r.json()
 
@@ -141,6 +158,7 @@ def run(
                 resp = _post_chat(
                     endpoint, model, messages,
                     max_tokens=32, temperature=0.0,
+                    session_id=session_id,
                 )
             except Exception as exc:
                 print(f"[turn {turn_idx}] FAIL: {exc}", file=sys.stderr)
@@ -178,6 +196,7 @@ def run(
                 resp = _post_chat(
                     endpoint, model, messages_q,
                     max_tokens=64, temperature=0.0,
+                    session_id=session_id,
                 )
             except Exception as exc:
                 print(f"[Q{q_idx}] FAIL: {exc}", file=sys.stderr)
@@ -220,6 +239,105 @@ def run(
             print(f"  Q{q_idx + 1}/{len(facts)} {f['entity']:>16} → "
                   f"{cls.classification:>14} ({t1 - t0:.1f}s)",
                   file=sys.stderr)
+    elif mode == "compact":
+        # Phase 1: ingest haystack directly to longctx-svc as chunks
+        # tagged with the harness session id. Each chunk carries its
+        # token range in the original haystack so coverage works.
+        if not longctx_endpoint:
+            raise ValueError("compact mode requires --longctx")
+        if not session_id:
+            raise ValueError("compact mode requires --session_id")
+        ingest_url = longctx_endpoint.rstrip("/") + "/evict/write"
+        # Reconstruct token-aligned ranges by re-encoding each chunk.
+        # synthetic_haystack split chunks at exact turn_tokens boundaries
+        # in token space, so chunk N occupies [N*turn_tokens, (N+1)*turn_tokens).
+        chunks_payload: list[dict] = []
+        for chunk_idx, chunk_text in enumerate(chunks):
+            tok_start = chunk_idx * turn_tokens
+            tok_end = tok_start + turn_tokens
+            chunks_payload.append({
+                "text": chunk_text,
+                "token_range": (tok_start, tok_end),
+                "layer": -3,    # synthetic external-memory marker
+                "score": 0.0,
+            })
+        BATCH = 32
+        t0 = time.time()
+        for i in range(0, len(chunks_payload), BATCH):
+            batch = chunks_payload[i:i + BATCH]
+            r = requests.post(ingest_url, json={
+                "session_id": session_id,
+                "chunks": batch,
+            }, timeout=120.0)
+            r.raise_for_status()
+            if (i // BATCH) % max(1, len(chunks_payload) // BATCH // 10) == 0:
+                print(
+                    f"  ingest {i + len(batch)}/{len(chunks_payload)} "
+                    f"chunks ({time.time() - t0:.1f}s)",
+                    file=sys.stderr,
+                )
+        t1 = time.time()
+        print(f"Phase 1 ingest: {len(chunks_payload)} chunks in "
+              f"{t1 - t0:.1f}s", file=sys.stderr)
+
+        # Phase 2: per-question fresh single-message chat. Server-side
+        # Tier 3 rehydrate (prefill_rehydrate.py:maybe_rehydrate_messages)
+        # retrieves from /evict/retrieve and prepends rescued chunks as a
+        # leading system message. Each request stays compact.
+        compact_system = (
+            "You answer factual questions about a long document. "
+            "Use only the recovered context provided to you. "
+            "Answer in one short sentence."
+        )
+        for q_idx, f in enumerate(facts):
+            question = f["question"]
+            messages_q = [
+                {"role": "system", "content": compact_system},
+                {"role": "user", "content": f"QUESTION: {question}"},
+            ]
+            t0 = time.time()
+            try:
+                resp = _post_chat(
+                    endpoint, model, messages_q,
+                    max_tokens=64, temperature=0.0,
+                    session_id=session_id,
+                )
+            except Exception as exc:
+                print(f"[Q{q_idx}] FAIL: {exc}", file=sys.stderr)
+                results.append(TurnResult(
+                    turn_idx=q_idx, role="question",
+                    question=question, fact_idx=f["fact_idx"],
+                    truth=f["answer"], kind=f["kind"],
+                    fact_token_pos=f["token_pos"],
+                    rationale=f"http_error: {exc}",
+                ))
+                continue
+            t1 = time.time()
+            ans = resp["choices"][0]["message"]["content"]
+            usage = resp.get("usage", {})
+            # Compact mode: no active KV holds the haystack. Disable
+            # native_hit detection by setting the active window to a
+            # zero-length range — every correct answer is therefore
+            # attributed to rescue retrieval, which is what we want.
+            cls = classify(ClassifyArgs(
+                kind=f["kind"], truth=f["answer"],
+                answer_text=ans, fact_token_pos=f["token_pos"],
+                active_window_lo=0, active_window_hi=0,
+            ))
+            results.append(TurnResult(
+                turn_idx=q_idx, role="question",
+                question=question, fact_idx=f["fact_idx"],
+                truth=f["answer"], kind=f["kind"],
+                fact_token_pos=f["token_pos"],
+                answer_text=ans, classification=cls.classification,
+                extracted_answer=cls.extracted_answer,
+                rationale=cls.rationale, elapsed_s=t1 - t0,
+                prompt_tokens=usage.get("prompt_tokens"),
+                completion_tokens=usage.get("completion_tokens"),
+            ))
+            print(f"  Q{q_idx + 1}/{len(facts)} {f['entity']:>16} → "
+                  f"{cls.classification:>14} ({t1 - t0:.1f}s)",
+                  file=sys.stderr)
     elif mode == "single_long":
         # Submit haystack + all questions in ONE turn. Will fail
         # past max_model_len; useful as a baseline contrast.
@@ -237,6 +355,7 @@ def run(
             resp = _post_chat(
                 endpoint, model, messages,
                 max_tokens=128 * len(facts), temperature=0.0,
+                session_id=session_id,
             )
             ans_block = resp["choices"][0]["message"]["content"]
         except Exception as exc:
@@ -314,7 +433,7 @@ def main():
     ap.add_argument("--turn_tokens", type=int, default=8192)
     ap.add_argument("--max_kv_active", type=int, default=32768)
     ap.add_argument("--mode", type=str, default="streaming",
-                    choices=["streaming", "single_long"])
+                    choices=["streaming", "compact", "single_long"])
     ap.add_argument("--longctx", type=str, default=None,
                     help="longctx-svc endpoint for coverage dump")
     ap.add_argument("--session_id", type=str, default=None,
