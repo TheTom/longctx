@@ -159,6 +159,8 @@ class ServiceConfig:
         "LONGCTX_TS", "0") == "1")
     use_coarse_filter: bool = field(default_factory=lambda: os.environ.get(
         "LONGCTX_COARSE_FILTER", "0") == "1")
+    use_symbol_augment: bool = field(default_factory=lambda: os.environ.get(
+        "LONGCTX_SYMBOL_AUGMENT", "1") == "1")
     limits: Limits = field(default_factory=Limits.from_env)
 
 

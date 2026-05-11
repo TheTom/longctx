@@ -26,6 +26,13 @@ from typing import Callable, Optional, Sequence
 
 import numpy as np
 
+from longctx.rag.symbol_augment import (
+    extract_symbols,
+    file_type_weight,
+    has_code_signal,
+    query_features,
+    symbol_grep_repo,
+)
 from longctx_daemon.storage.protocol import ChunkStore, EmbedStore
 from longctx_daemon.types import (
     Citation,
@@ -723,6 +730,50 @@ class Searcher:
                 for cid, score in fused
                 if cid in chunks_by_id
             ]
+            # Symbol-aware re-rank (2026-05-11). For code-signal queries
+            # (traceback / error type / class/def mention), grep the
+            # primary project's root for `class X` / `def X` definitions
+            # of every identifier in the query. Boost chunks whose source
+            # file is a definition site, then apply a file-type prior
+            # (.py boost, .rst/.md demote). Bridges the BM25+dense bias
+            # toward docs/changelogs over source on SWE-bench-style
+            # code-fix queries. No-op when the primary project has no
+            # known root or the query has no extractable identifiers.
+            qf = query_features(query)
+            if has_code_signal(qf) and scope.primary_project:
+                project_root: Optional[str] = None
+                try:
+                    for p in self._chunk_store.list_projects():
+                        if p.name == scope.primary_project:
+                            project_root = p.root_path
+                            break
+                except Exception:  # noqa: BLE001
+                    project_root = None
+                sym_paths_set: set[str] = set()
+                if project_root:
+                    try:
+                        from pathlib import Path as _Path
+                        syms = extract_symbols(query)
+                        if syms:
+                            sym_paths_set = {
+                                str(_Path(p).resolve())
+                                for p in symbol_grep_repo(
+                                    syms, _Path(project_root),
+                                )
+                            }
+                    except Exception:  # noqa: BLE001
+                        sym_paths_set = set()
+
+                def _augment_key(item: tuple) -> tuple[float, float]:
+                    chunk_obj, score_val = item
+                    abs_path = self._chunk_path_abs(chunk_obj)
+                    sym_boost = 1.5 if abs_path in sym_paths_set else 1.0
+                    type_w = file_type_weight(abs_path, qf)
+                    # Sort descending by (sym_boost, type_w, score).
+                    return (-(sym_boost * type_w), -float(score_val))
+
+                ranked_chunks.sort(key=_augment_key)
+
             # Token-budget enforcement: greedy take-until-overflow.
             # Ordered by fused score so the highest-relevance chunks
             # are kept.
@@ -1158,6 +1209,33 @@ class Searcher:
             start_line=chunk.start_line,
             end_line=chunk.end_line,
         )
+
+    def _chunk_path_abs(self, chunk) -> str:
+        """Best-effort absolute path for a chunk's source file.
+
+        Used by the symbol-aware re-rank to match against rg's grep
+        output. Tolerant of stores that don't expose ``get_file_by_id``
+        / ``list_projects`` (test fakes, partial mocks) — returns the
+        empty string when it can't resolve, which makes the augment a
+        no-op for that chunk.
+        """
+        get_file = getattr(self._chunk_store, "get_file_by_id", None)
+        if not callable(get_file):
+            return ""
+        try:
+            file_rec = get_file(chunk.file_id)
+        except Exception:  # noqa: BLE001
+            return ""
+        if file_rec is None:
+            return ""
+        try:
+            for p in self._chunk_store.list_projects():
+                if p.name == file_rec.project:
+                    from pathlib import Path as _Path
+                    return str((_Path(p.root_path) / file_rec.rel_path).resolve())
+        except Exception:  # noqa: BLE001
+            return ""
+        return ""
 
     def _chunk_token_count(self, chunk) -> int:
         """Best-effort token count for budget enforcement.

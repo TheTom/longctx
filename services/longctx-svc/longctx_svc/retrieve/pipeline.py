@@ -10,15 +10,26 @@ huge (≥`coarse_filter_min_chunks`) and `use_coarse_filter=True` —
 mirrors `longctx.rag.coarse_filter` plumbing for catching rare-term
 queries (identifiers, codes, names) that lose to cosine alone. See
 docs/PRD-12m-coarse-filter.md.
+
+Symbol-aware augment (2026-05-11): when the caller provides a scope
+root, extract Python identifiers from the query, grep the scope for
+`class X` / `def X` definition sites, promote chunks from those files
+into the prefilter pool, and apply a file-type prior (.py boost, docs
+demote) when the query has a code signal. Recovers retrieval cases
+where bge-m3 dense ranks docs/changelogs above source.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from weakref import WeakKeyDictionary
 
 import numpy as np
 
+from longctx.rag.symbol_augment import (
+    extract_symbols, file_type_weight, query_features, symbol_grep_repo,
+)
 from longctx_svc.config import get_config
 from longctx_svc.indexer.builder import ScopeIndex
 from longctx_svc.indexer.chunker import Chunk
@@ -48,6 +59,7 @@ class RetrieveResult:
     paraphrases: list[str]      # the queries that were embedded (incl. original)
     used_rerank: bool
     used_coarse_filter: bool = False   # BM25 ⊕ dense RRF fusion lane
+    used_symbol_augment: bool = False  # symbol-grep + file-type prior
 
 
 # Generic paraphrase templates — work for code, prose, and config queries.
@@ -182,7 +194,9 @@ class RetrievePipeline:
     def retrieve(self, query: str, index: ScopeIndex, top_k: int = 8,
                  prefilter: int = 100,
                  use_rerank: bool = True,
-                 use_coarse_filter: bool | None = None) -> RetrieveResult:
+                 use_coarse_filter: bool | None = None,
+                 scope_root: Path | None = None,
+                 use_symbol_augment: bool | None = None) -> RetrieveResult:
         """Multi-query + rerank retrieval over a ScopeIndex.
 
         Scale-aware: at small scope sizes (<rerank_min_chunks) the rerank
@@ -276,6 +290,45 @@ class RetrievePipeline:
         else:
             cos_top = np.argsort(-max_sims)[:cos_top_n].tolist()
 
+        # Symbol-aware augment. Greps the scope for `class X` / `def X`
+        # definitions of identifiers in the query and promotes chunks
+        # from those files into the candidate pool. Then applies a
+        # file-type prior (.py boost, doc demote) when the query has a
+        # code signal. No-op without scope_root or when the query lacks
+        # extractable identifiers.
+        do_symbol_augment = (
+            (use_symbol_augment if use_symbol_augment is not None
+             else cfg.use_symbol_augment)
+            and scope_root is not None
+        )
+        used_symbol_augment = False
+        if do_symbol_augment:
+            symbols = extract_symbols(query)
+            if symbols:
+                sym_paths = symbol_grep_repo(symbols, scope_root)
+                if sym_paths:
+                    sym_path_set = {str(Path(p).resolve()) for p in sym_paths}
+                    chunk_paths_norm = [
+                        str(Path(index.chunks[i].file_path).resolve())
+                        for i in range(n_chunks)
+                    ]
+                    sym_chunk_idx = [
+                        i for i, p in enumerate(chunk_paths_norm)
+                        if p in sym_path_set
+                    ]
+                    seen = set(cos_top)
+                    for i in sym_chunk_idx:
+                        if i not in seen:
+                            cos_top.append(i)
+                            seen.add(i)
+                    used_symbol_augment = True
+            qf = query_features(query)
+            cos_top.sort(
+                key=lambda i: -file_type_weight(
+                    index.chunks[i].file_path, qf,
+                ),
+            )
+
         # Scale-aware rerank gate. The cross-encoder is the dominant
         # latency at small scope sizes — cosine alone is already strong
         # there, so skip the rerank.
@@ -312,4 +365,5 @@ class RetrievePipeline:
             paraphrases=paraphrases,
             used_rerank=used_rerank,
             used_coarse_filter=used_coarse_filter,
+            used_symbol_augment=used_symbol_augment,
         )
