@@ -7,7 +7,7 @@ name = "longctx"
 version = "0.3.1"
 description = "Open long-context inference stack: retrieval + open weights, no closed parts."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "TheTom"}

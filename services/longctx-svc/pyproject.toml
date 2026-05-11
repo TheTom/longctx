@@ -7,7 +7,7 @@ name = "longctx-svc"
 version = "0.3.1"
 description = "Local retrieval companion for inference servers — scoped, session-aware, file-watching."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
 authors = [{name = "TheTom"}]
 keywords = ["retrieval", "rag", "llm", "long-context", "service", "vllm", "llama-cpp"]
