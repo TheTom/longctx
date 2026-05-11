@@ -331,7 +331,12 @@ def _embedder_sha256(embedder) -> str:  # noqa: ANN001 — duck-typed
                 hit = try_to_load_from_cache(
                     repo_id=model_name, filename=fname,
                 )
-                if hit and Path(hit).is_file():
+                # try_to_load_from_cache returns one of:
+                #   - str path (cache hit)
+                #   - None (never downloaded)
+                #   - _CACHED_NO_EXIST sentinel (known-missing remote file)
+                # The sentinel is a truthy non-str object; guard with isinstance.
+                if isinstance(hit, str) and Path(hit).is_file():
                     return _sha256_file(Path(hit))
         except ImportError:
             pass
@@ -473,6 +478,12 @@ class Indexer:
             n_chunks_total += res[0]
             n_chunks_new += res[1]
             n_chunks_reused += res[2]
+            # Drain MPS / CUDA allocator caches every 500 files so RSS
+            # stays bounded across million-LOC corpora. The allocator
+            # holds released blocks in a process-local pool by default;
+            # this returns them to the OS. Sub-second cost per drain.
+            if n_files % 500 == 0:
+                self._drain_allocator_cache()
 
         # Update last_full_scan_at; preserve other fields.
         self._store.upsert_project(Project(
@@ -865,16 +876,51 @@ class Indexer:
         """Wrap embedder.encode with the daemon's standard kwargs.
 
         L2-normalized so dot product == cosine on the dense store.
+
+        Wrapped in ``torch.inference_mode()`` (stronger than the
+        internal ``no_grad`` SentenceTransformer applies) so no grad
+        graph builds even if a future caller forgets ``model.eval()``.
+        Cheap belt-and-suspenders against autograd-cache growth.
         """
-        out = self._embedder.encode(
-            texts,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-            batch_size=self._config.embed_batch_size,
-            show_progress_bar=False,
-        )
+        try:
+            import torch
+            ctx = torch.inference_mode()
+        except ImportError:
+            from contextlib import nullcontext
+            ctx = nullcontext()
+        with ctx:
+            out = self._embedder.encode(
+                texts,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+                batch_size=self._config.embed_batch_size,
+                show_progress_bar=False,
+            )
         # Some test doubles return list[list[float]]; coerce to ndarray.
         return np.asarray(out, dtype=np.float32)
+
+    def _drain_allocator_cache(self) -> None:
+        """Release cached device memory back to the OS. PyTorch's MPS +
+        CUDA allocators keep freed blocks in a per-process pool by
+        default; over a long ``full_scan`` this drives RSS up linearly
+        even though there is no real Python-level leak. Call every N
+        files to bound the working set.
+        """
+        try:
+            import gc, torch
+        except ImportError:
+            return
+        gc.collect()
+        if hasattr(torch, "mps") and torch.backends.mps.is_available():
+            try:
+                torch.mps.empty_cache()
+            except Exception:  # noqa: BLE001
+                pass
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _assert_embedder_consistent(self) -> None:
         """Compare the embedder's current SHA against the most-recent

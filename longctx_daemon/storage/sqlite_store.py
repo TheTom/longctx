@@ -25,7 +25,7 @@ import sqlite3
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Iterable, Iterator, Optional, Sequence
 
 import numpy as np
 from rank_bm25 import BM25Okapi
@@ -45,6 +45,21 @@ from longctx_daemon.types import (
 #: ascending order. An older daemon hitting a future schema raises
 #: ``UnsupportedSchemaError`` so we never read bad pages.
 SCHEMA_VERSION = 1
+
+#: Maximum bind parameters per IN-clause batch. Apple's bundled SQLite
+#: keeps SQLITE_MAX_VARIABLE_NUMBER at 999; SQLite 3.32+ raised it to
+#: 32766 but we can't assume the runtime build. 500 stays safely below
+#: both, leaves headroom for a few non-IN binds in the same query, and
+#: the per-batch overhead is negligible at any realistic corpus size.
+_SQL_IN_BATCH = 500
+
+
+def _ibatched(seq: Sequence[Any], n: int) -> Iterator[list]:
+    """Yield successive ``n``-sized chunks from ``seq``. Used to batch
+    ``WHERE col IN (?, ?, …)`` queries so a 1M-chunk corpus does not
+    overflow SQLite's bind parameter limit."""
+    for i in range(0, len(seq), n):
+        yield list(seq[i:i + n])
 
 #: Minimum SQLite library version required for WAL semantics + ``ON DELETE
 #: CASCADE`` foreign keys. 3.37 ships ``STRICT`` tables and the new
@@ -498,15 +513,18 @@ class SqliteChunkStore:
         ids = list(ids)
         if not ids:
             return ()
-        # SQLite's parameter limit is high but finite; chunk-batch via IN clause.
-        placeholders = ",".join("?" * len(ids))
+        # SQLite's SQLITE_MAX_VARIABLE_NUMBER is 999 on older builds (Apple's
+        # bundled sqlite). Batch IN-clause to stay safely below the limit.
+        by_id: dict[int, Any] = {}
         with self._lock:
-            rows = self._conn.execute(
-                f"SELECT * FROM chunks WHERE id IN ({placeholders})",
-                ids,
-            ).fetchall()
-        # Preserve caller-requested ordering (handy for ranked-hit fetch).
-        by_id = {r["id"]: r for r in rows}
+            for batch in _ibatched(ids, _SQL_IN_BATCH):
+                placeholders = ",".join("?" * len(batch))
+                for r in self._conn.execute(
+                    f"SELECT * FROM chunks WHERE id IN ({placeholders})",
+                    batch,
+                ).fetchall():
+                    by_id[r["id"]] = r
+        # Preserve caller-requested ordering.
         return tuple(
             self._row_to_chunk(by_id[i]) for i in ids if i in by_id
         )
@@ -521,14 +539,17 @@ class SqliteChunkStore:
         hashes = list(content_hashes)
         if not hashes:
             return ()
-        placeholders = ",".join("?" * len(hashes))
+        out: list = []
         with self._lock:
-            rows = self._conn.execute(
-                f"SELECT * FROM chunks WHERE file_id = ? "
-                f"AND content_hash IN ({placeholders})",
-                [file_id, *hashes],
-            ).fetchall()
-        return tuple(self._row_to_chunk(r) for r in rows)
+            # file_id is one bind, leaving _SQL_IN_BATCH-1 for hashes.
+            for batch in _ibatched(hashes, _SQL_IN_BATCH - 1):
+                placeholders = ",".join("?" * len(batch))
+                out.extend(self._conn.execute(
+                    f"SELECT * FROM chunks WHERE file_id = ? "
+                    f"AND content_hash IN ({placeholders})",
+                    [file_id, *batch],
+                ).fetchall())
+        return tuple(self._row_to_chunk(r) for r in out)
 
     def delete_chunks_by_file(self, file_id: int) -> None:
         """Drop all chunks for a file_id without touching the file
@@ -574,14 +595,17 @@ class SqliteChunkStore:
         rows_list = [r for r in rows if r is not None and r >= 0]
         if not rows_list:
             return {}
-        placeholders = ",".join("?" * len(rows_list))
+        out: dict[int, int] = {}
         with self._lock:
-            sql = (
-                f"SELECT id, embedding_row FROM chunks "
-                f"WHERE embedding_row IN ({placeholders})"
-            )
-            cur = self._conn.execute(sql, rows_list)
-            return {int(r["embedding_row"]): int(r["id"]) for r in cur.fetchall()}
+            for batch in _ibatched(rows_list, _SQL_IN_BATCH):
+                placeholders = ",".join("?" * len(batch))
+                sql = (
+                    f"SELECT id, embedding_row FROM chunks "
+                    f"WHERE embedding_row IN ({placeholders})"
+                )
+                for r in self._conn.execute(sql, batch).fetchall():
+                    out[int(r["embedding_row"])] = int(r["id"])
+        return out
 
     def get_embedding_rows_by_chunk_ids(
         self, ids: Iterable[int],
@@ -594,16 +618,18 @@ class SqliteChunkStore:
         ids_list = [i for i in ids if i is not None and i >= 0]
         if not ids_list:
             return ()
-        placeholders = ",".join("?" * len(ids_list))
+        seen: set[int] = set()
         with self._lock:
-            sql = (
-                f"SELECT embedding_row FROM chunks "
-                f"WHERE id IN ({placeholders}) "
-                f"AND embedding_row IS NOT NULL"
-            )
-            cur = self._conn.execute(sql, ids_list)
-            rows = sorted({int(r["embedding_row"]) for r in cur.fetchall()})
-        return tuple(rows)
+            for batch in _ibatched(ids_list, _SQL_IN_BATCH):
+                placeholders = ",".join("?" * len(batch))
+                sql = (
+                    f"SELECT embedding_row FROM chunks "
+                    f"WHERE id IN ({placeholders}) "
+                    f"AND embedding_row IS NOT NULL"
+                )
+                for r in self._conn.execute(sql, batch).fetchall():
+                    seen.add(int(r["embedding_row"]))
+        return tuple(sorted(seen))
 
     def chunk_count(self, scope: Optional[ScopeFilter] = None) -> int:
         with self._lock:
@@ -746,15 +772,24 @@ class SqliteChunkStore:
         if self._bm25 is None:
             return
         ids = list(self._bm25_chunk_ids)
-        rows = self._conn.execute(
-            "SELECT content_hash FROM chunks WHERE id IN ("
-            + ",".join("?" * len(ids))
-            + ") ORDER BY id"
-            if ids else
-            "SELECT content_hash FROM chunks WHERE 0",
-            ids,
-        ).fetchall()
-        digest = _digest_chunks(ids, [r["content_hash"] for r in rows])
+        if not ids:
+            digest = _digest_chunks([], [])
+        else:
+            # Same SQLITE_MAX_VARIABLE_NUMBER concern as elsewhere — at
+            # 1M+ corpus this query would otherwise overflow the bind
+            # parameter limit. Batch + reassemble preserving id-order.
+            by_id: dict[int, str] = {}
+            for batch in _ibatched(ids, _SQL_IN_BATCH):
+                placeholders = ",".join("?" * len(batch))
+                for r in self._conn.execute(
+                    f"SELECT id, content_hash FROM chunks "
+                    f"WHERE id IN ({placeholders})",
+                    batch,
+                ).fetchall():
+                    by_id[int(r["id"])] = r["content_hash"]
+            digest = _digest_chunks(
+                ids, [by_id.get(i, "") for i in ids],
+            )
         snap = _BM25Snapshot(
             chunk_count=len(ids), corpus_digest=digest,
             chunk_ids=tuple(ids),

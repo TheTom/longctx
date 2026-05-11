@@ -425,7 +425,17 @@ class MemmapEmbedStore:
             # Read once into a numpy array; matmul against the live
             # memmap region. Slicing in numpy is a view, not a copy.
             view = np.asarray(self._mm[:n])
-            scores = view @ q   # (n,)
+            # Compute in suppressed-warning mode and sanitise non-finite
+            # entries afterwards. Embeddings are L2-normalised fp32 (verified
+            # max |x|≈0.31), so a clean matmul cannot overflow — but freelist
+            # rows, partially-written rows during concurrent appends, or
+            # corrupted bytes on disk could produce nan/inf and silently
+            # corrupt rankings. Treat any non-finite score as
+            # "definitely not in the top-K" rather than letting it propagate.
+            with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+                scores = view @ q   # (n,)
+            if not np.all(np.isfinite(scores)):
+                scores = np.where(np.isfinite(scores), scores, -np.inf)
 
             # Mask freelist (zeroed rows score 0; we don't want them).
             if self._state.freelist:
