@@ -1,0 +1,28 @@
+{
+  "date": "2026-05-08",
+  "machine": "M5 Max / MPS",
+  "embedder": "BAAI/bge-small-en-v1.5",
+  "config": "tokens_per_chunk=2048, top_k=1000, multi_query=4 paraphrases",
+  "corpora": [
+    {"path": "/Users/tom/dev/mlx-swift-lm", "extensions": [".swift",".cpp",".h",".c",".metal",".md",".py",".txt"], "files": 350,  "chars": 6974557},
+    {"path": "/Users/tom/local_llms/llama.cpp", "extensions": [".cpp",".h",".c",".cu",".metal",".md",".py"], "files": 1269, "chars": 39823737},
+    {"path": "/Users/tom/dev/vllm-swift", "extensions": [".swift",".cpp",".h",".c",".metal",".md",".py"], "files": 70,   "chars": 823957},
+    {"path": "/Users/tom/Documents/obsidian/Self Study", "extensions": [".md"], "files": 1707, "chars": 5947637}
+  ],
+  "totals": {
+    "files": 3396,
+    "chars": 53569894,
+    "approx_tokens": 13392473,
+    "n_chunks": 7300
+  },
+  "result": {
+    "needle_in_topk": true,
+    "needle_rank": 10,
+    "top_k": 1000,
+    "walk_secs": 1.3,
+    "chunk_secs": 0.06,
+    "filter_secs": 37.4,
+    "total_secs": 38.8
+  },
+  "note": "First real-corpus context-length probe. Beats the 12M-token spec target on real first-party code+prose, not synthetic filler. Multi-query (4 paraphrases) used because it's the right call on real data — see RESULTS.md."
+}

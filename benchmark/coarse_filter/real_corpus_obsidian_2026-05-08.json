@@ -1,0 +1,31 @@
+{
+  "corpus": "obsidian-vault",
+  "results": [
+    {
+      "mode": "single_literal",
+      "rank": 32,
+      "t": 0.36,
+      "tokens": 1486954
+    },
+    {
+      "mode": "multi_query",
+      "rank": 3,
+      "t": 0.34,
+      "tokens": 1486954
+    },
+    {
+      "mode": "multi_top100",
+      "rank": 3,
+      "t": 0.31,
+      "tokens": 1486954
+    },
+    {
+      "mode": "multi_top10",
+      "rank": 3,
+      "t": 0.31,
+      "tokens": 1486954
+    }
+  ],
+  "embedder": "BAAI/bge-small-en-v1.5",
+  "device": "mps"
+}

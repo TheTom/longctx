@@ -57,6 +57,7 @@ def _make_pipeline(reranker=False):
         from longctx import RetrievalPipeline
         return RetrievalPipeline(
             reranker_model="fake/reranker" if reranker else None,
+            cache_dir=None,  # avoid disk-cache dim-mismatch under mocks
         )
 
 

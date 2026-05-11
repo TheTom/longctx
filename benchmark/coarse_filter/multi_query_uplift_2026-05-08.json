@@ -1,0 +1,15 @@
+{
+  "config": "12M hard mode seed 0",
+  "single_literal": {
+    "rank": 451,
+    "t": 1.29
+  },
+  "multi_4_queries": {
+    "rank": 3,
+    "t": 1.31
+  },
+  "multi_3_paraphrase": {
+    "rank": 1,
+    "t": 1.24
+  }
+}

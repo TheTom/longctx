@@ -94,6 +94,45 @@ Plumbing (chunk retrieval) is identical across all models. Answer quality depend
 
 ---
 
+## Ask your entire codebase a question, on a laptop
+
+Point the pipeline at any directory tree. It walks files, chunks them token-aware, and runs a BM25 + dense embedding hybrid filter (Reciprocal Rank Fusion, k=60) over the whole thing. M5 Max / MPS / `bge-small-en-v1.5` handles **13.4M tokens of code+docs end-to-end in 39 seconds cold**. The library half ships this; longctx-svc wires the same fusion lane behind `LONGCTX_COARSE_FILTER=1` for huge scopes.
+
+```bash
+python -m longctx.eval.bench_coarse_filter_real \
+    --corpus-dir ~/dev/your-monorepo \
+    --extensions .py,.swift,.md \
+    --top-k 1000
+```
+
+### Three real questions, no planted needles
+
+Aggregated four of my own repos into one corpus — `mlx-swift-lm`, `llama.cpp`, `vllm-swift`, the obsidian vault, plus `longctx` itself. **3,396 files / 53.6M chars / ~13.4M tokens / 7,423 chunks.** Then asked things I know the answer to because I wrote them. Multi-query paraphrase fusion, top-5 each:
+
+| # | question | top-5 hit | best rank |
+|---|---|:-:|:-:|
+| 1 | *"Where is multi-query paraphrase fusion implemented in longctx?"* | ✓ | **1** (`CHANGELOG.md` + `coarse_filter.py`) |
+| 2 | *"Why bge-small over MiniLM-L6 as the default embedder?"* | ✓ | **1** (`RESULTS.md` ablation table) |
+| 3 | *"Where does mlx-swift-lm gate the centroid sparse path on context length?"* | ✓ | **3** (chunk citing `BlockSparseConfig.minContextForSparse`) |
+
+3/3 found, ~1.5s per query on warm cache. The pipeline pays the embed cost once on first walk; subsequent queries are just BM25 + RRF + cosine.
+
+### Distribution study (real corpus, no cherry-picking)
+
+20 needles planted across 4 character offsets (5M, 15M, 30M, 45M) × 5 content types (function definition, prose paragraph, config value, code comment, error message). Rank measured for each, both modes:
+
+|                | min | median | p90 | p95 | max | misses |
+|---|---:|---:|---:|---:|---:|---:|
+| single-query   | 1   | 9.5    | 25  | 47  | 177 | 0/20 |
+| multi-query    | 1   | **4**  | 17  | **41** | 108 | 0/20 |
+
+20/20 hit recall@1000 either way. Multi-query halves median rank and clears p95 at 41. Outliers (177, 108) were function-def needles in a corpus dominated by Swift function definitions — the embedder has nothing to discriminate on.
+
+Full sweeps + caveats: [`benchmark/coarse_filter/RESULTS.md`](benchmark/coarse_filter/RESULTS.md).
+Spec: [`docs/PRD-12m-coarse-filter.md`](docs/PRD-12m-coarse-filter.md).
+
+---
+
 ## Metrics so far
 
 **MRCR v2 8-needle, single MI300X, Qwen2.5-32B-Instruct via vLLM (2026-05-06/07)**

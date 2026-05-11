@@ -1,5 +1,107 @@
 # Changelog
 
+## longctx unreleased — 12M coarse filter (hierarchical-selector pipeline)
+
+Pre-release; lives on `feature/coarse-filter-12m`. Not yet shipped.
+
+### Why
+
+`RetrievalPipeline.retrieve_chunked` works well up to ~100K tokens.
+Above that, the dense embed pass and the optional cross-encoder
+rerank stage are both unbounded — at 12M tokens the rerank stage
+sees thousands of chunks. The fix is a cheap **coarse filter** in
+front of the existing rerank+pick pipeline so downstream stages
+always see a bounded top-K regardless of input size.
+
+### Added
+
+- **`longctx.rag.coarse_filter.CoarseFilter`** — BM25 + dense embedding
+  hybrid with Reciprocal Rank Fusion (k=60). Default embedder
+  `BAAI/bge-small-en-v1.5`. `bm25_weight=0` or `dense_weight=0`
+  selects pure-dense or pure-BM25 mode (tier 4.3 in
+  `docs/embedding-roadmap.md`).
+- **`CoarseFilter.filter_multi_query(chunks, queries)`** — RRF-fuses
+  rankings across N paraphrase queries. One BM25 build + one dense
+  embed pass; per-query cost is just an argsort. ~150× rank
+  improvement on the 12M hard mode worst case (rank 451 → 1) at the
+  same wall time.
+- **`longctx.rag.chunker.Chunker`** — token-aware chunker with stable
+  Chunk ids (position-prefixed, content-hashed). Char-proxy mode
+  (default) or HF tokenizer mode via `offset_mapping`.
+- **`RetrievalPipeline.retrieve_chunked` integration** — new args
+  `coarse_filter_threshold_chars` (default ~400K chars / 100K tokens)
+  and `coarse_filter_top_n` (default 1000). Below threshold the path
+  is byte-identical to today's behavior so MRCR v2 numbers stay
+  pinned. Above threshold the prefilter trims chunks before the
+  dense rerank stage.
+- **`longctx-svc.RetrievePipeline` fusion lane** — optional BM25 +
+  dense RRF fusion for huge scopes. Enable with
+  `LONGCTX_COARSE_FILTER=1` or `use_coarse_filter=True`. Fires above
+  `coarse_filter_min_chunks` (default 5000). Per-index BM25 cache,
+  invalidates on chunk-count change. Surfaces `used_coarse_filter`
+  in `RetrieveResult`.
+- **`longctx.eval.bench_coarse_filter`** — synthetic NIAH bench
+  (`longctx-coarse-bench` CLI). `--hard` mode swaps in topically-
+  overlapping filler. `--query-index` selects from four paraphrase
+  queries. `--multi-query` exercises filter_multi_query.
+- **`longctx.eval.bench_coarse_filter_real`** — real-corpus NIAH
+  bench. Walks a directory, plants a needle, runs the pipeline.
+  Privacy-preserving: only summary metrics saved.
+- **`docs/PRD-12m-coarse-filter.md`** — spec document.
+- **`benchmark/coarse_filter/RESULTS.md`** — sweep tables + caveats.
+
+### Numbers (M5 Max / MPS / bge-small / synthetic NIAH)
+
+| target | top-K | n_chunks → kept | recall@top-K | total |
+|---:|---:|---:|---:|---:|
+| 100K  |  100 |   55 →  55 | 100% | <1s |
+| 1M    | 1000 |  545 → 545 | 100% | ~3s |
+| 4M    | 1000 | 2177 →1000 | 100% | ~9s |
+| 12M   | 1000 | 6531 →1000 | 100% | ~30s |
+
+Hard-mode (topically-overlapping filler) recall@top-1000 = 24/24
+across {100K, 1M, 4M, 12M} × 4 paraphrase queries. Borderline case:
+12M + literal query + hard filler hits rank 451 inside top-1000;
+multi-query fusion drops that to rank 1.
+
+### Real-corpus data point (obsidian vault, ~1.5M tokens)
+
+| top-K | mode | needle rank |
+|---:|---|---:|
+| 1000 | single literal     | 32 |
+| 1000 | multi-query (4)    | 3 |
+|   10 | multi-query (4)    | 3 |
+
+### Embedder ablation (multi-query, top-1000)
+
+| corpus | MiniLM-L6 | bge-small | bge-m3 |
+|---|---:|---:|---:|
+| synth 1M hard | 26 | **8** | 11 |
+| obsidian vault | **1** | 3 | OOM |
+
+bge-small remains the right default. bge-m3 OOMs on real vault
+(146 GiB request). MiniLM-L6 is a viable fallback.
+
+### Test coverage
+
+- 16 unit tests on `CoarseFilter` (includes multi-query)
+- 15 unit tests on `Chunker`
+- 3 unit tests on `retrieve_chunked` coarse-filter integration
+- 6 unit tests on the bench harness
+- 6 unit tests on the longctx-svc fusion lane
+- Full suite: **310/310** passing (94 longctx + 216 longctx-svc)
+
+### Compat
+
+Existing `retrieve_chunked` callers see no behavior change unless
+total candidate text is ≥ ~400K chars AND chunk count exceeds
+`coarse_filter_top_n` (default 1000). Pass
+`coarse_filter_threshold_chars=None` to disable the prefilter
+unconditionally. The longctx-svc fusion lane is **off by default** —
+enable explicitly via `LONGCTX_COARSE_FILTER=1`.
+
+---
+
 ## longctx-svc v0.3.0a3 (2026-05-07) — splice budget cap + sidecar leak guards
 
 ### Why

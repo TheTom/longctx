@@ -1,0 +1,11 @@
+{
+  "note": "Ablation 2026-05-08 on M5 Max / MPS. Speed numbers reflect cache state, NOT pure model speed. Quality (rank) is the comparable metric. bge-m3 crashed on real vault (1024-dim × N chunks materialized at 146 GiB). All runs use multi-query = 4 paraphrases.",
+  "results": [
+    {"corpus": "synth_1M_hard", "embedder": "sentence-transformers/all-MiniLM-L6-v2", "rank": 26, "hit": true, "t_secs": 0.99},
+    {"corpus": "synth_1M_hard", "embedder": "BAAI/bge-small-en-v1.5",                  "rank": 8,  "hit": true, "t_secs": 0.12},
+    {"corpus": "synth_1M_hard", "embedder": "BAAI/bge-m3",                              "rank": 11, "hit": true, "t_secs": 141.55},
+    {"corpus": "obsidian_vault", "embedder": "sentence-transformers/all-MiniLM-L6-v2", "rank": 1,  "hit": true, "t_secs": 1.74},
+    {"corpus": "obsidian_vault", "embedder": "BAAI/bge-small-en-v1.5",                  "rank": 3,  "hit": true, "t_secs": 0.40},
+    {"corpus": "obsidian_vault", "embedder": "BAAI/bge-m3",                              "rank": null, "hit": false, "t_secs": null, "error": "Invalid buffer size: 146.21 GiB (1024-dim × full corpus materialized at once on MPS)"}
+  ]
+}

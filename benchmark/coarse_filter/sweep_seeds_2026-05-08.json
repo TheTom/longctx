@@ -1,0 +1,115 @@
+{
+  "rungs": [
+    {
+      "tokens": 100000,
+      "top_k": 100,
+      "seed": 0,
+      "n_chunks": 55,
+      "n_kept": 55,
+      "rank": 1,
+      "hit": true,
+      "chunk_s": 0.0,
+      "filter_s": 0.094,
+      "total_s": 0.095
+    },
+    {
+      "tokens": 100000,
+      "top_k": 100,
+      "seed": 1,
+      "n_chunks": 55,
+      "n_kept": 55,
+      "rank": 1,
+      "hit": true,
+      "chunk_s": 0.0,
+      "filter_s": 0.37,
+      "total_s": 0.37
+    },
+    {
+      "tokens": 100000,
+      "top_k": 100,
+      "seed": 2,
+      "n_chunks": 55,
+      "n_kept": 55,
+      "rank": 1,
+      "hit": true,
+      "chunk_s": 0.0,
+      "filter_s": 0.348,
+      "total_s": 0.348
+    },
+    {
+      "tokens": 1000000,
+      "top_k": 1000,
+      "seed": 0,
+      "n_chunks": 545,
+      "n_kept": 545,
+      "rank": 1,
+      "hit": true,
+      "chunk_s": 0.003,
+      "filter_s": 0.123,
+      "total_s": 0.126
+    },
+    {
+      "tokens": 1000000,
+      "top_k": 1000,
+      "seed": 1,
+      "n_chunks": 545,
+      "n_kept": 545,
+      "rank": 1,
+      "hit": true,
+      "chunk_s": 0.003,
+      "filter_s": 2.889,
+      "total_s": 2.892
+    },
+    {
+      "tokens": 1000000,
+      "top_k": 1000,
+      "seed": 2,
+      "n_chunks": 545,
+      "n_kept": 545,
+      "rank": 1,
+      "hit": true,
+      "chunk_s": 0.003,
+      "filter_s": 2.844,
+      "total_s": 2.847
+    },
+    {
+      "tokens": 4000000,
+      "top_k": 1000,
+      "seed": 0,
+      "n_chunks": 2177,
+      "n_kept": 1000,
+      "rank": 12,
+      "hit": true,
+      "chunk_s": 0.012,
+      "filter_s": 0.39,
+      "total_s": 0.402
+    },
+    {
+      "tokens": 4000000,
+      "top_k": 1000,
+      "seed": 1,
+      "n_chunks": 2177,
+      "n_kept": 1000,
+      "rank": 1,
+      "hit": true,
+      "chunk_s": 0.012,
+      "filter_s": 9.209,
+      "total_s": 9.22
+    },
+    {
+      "tokens": 4000000,
+      "top_k": 1000,
+      "seed": 2,
+      "n_chunks": 2178,
+      "n_kept": 1000,
+      "rank": 9,
+      "hit": true,
+      "chunk_s": 0.012,
+      "filter_s": 9.163,
+      "total_s": 9.176
+    }
+  ],
+  "embedder": "BAAI/bge-small-en-v1.5",
+  "device": "mps",
+  "note": "M5 Max, synthetic NIAH, run 2026-05-08"
+}

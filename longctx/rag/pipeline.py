@@ -115,6 +115,8 @@ class RetrievalPipeline:
         chunk_size: int = 500,
         chunk_overlap: int = 50,
         preserve_order: bool = True,
+        coarse_filter_threshold_chars: int | None = 400_000,
+        coarse_filter_top_n: int = 1000,
     ) -> RetrievalResult:
         """Hierarchical chunked retrieval over long candidates.
 
@@ -132,6 +134,14 @@ class RetrievalPipeline:
         speed. Set to 500 for default. Larger chunks reduce
         discriminative power; smaller chunks add overhead.
 
+        For huge inputs (≥ ~100K tokens worth of candidates), an optional
+        BM25 + dense + RRF coarse filter trims chunks down to
+        ``coarse_filter_top_n`` *before* the dense rerank stage. Below
+        threshold, behavior is byte-identical to the pre-coarse-filter
+        path so existing MRCR v2 numbers are preserved exactly. Pass
+        ``coarse_filter_threshold_chars=None`` to disable the prefilter
+        unconditionally.
+
         Args:
             query: question / target
             candidates: list of candidate texts (typically long messages)
@@ -139,6 +149,13 @@ class RetrievalPipeline:
             chunk_size: approximate tokens per sub-chunk
             chunk_overlap: token overlap between adjacent chunks
             preserve_order: return parents in original input order
+            coarse_filter_threshold_chars: total candidate-text length
+                above which the BM25 + dense coarse prefilter kicks in.
+                Default ~400K chars (≈100K tokens at 4 chars/token).
+                ``None`` disables the prefilter.
+            coarse_filter_top_n: chunks kept by the coarse filter when
+                it fires. Default 1000, sized so the bge-small embed +
+                cross-encoder rerank stays bounded at large input scale.
 
         Returns:
             RetrievalResult with indices, candidates, scores
@@ -162,6 +179,40 @@ class RetrievalPipeline:
                 if end == len(msg):
                     break
                 start += stride
+
+        # ─── Stage 1: optional BM25 + dense coarse prefilter ──────────────
+        # Only fires above threshold so we don't perturb established
+        # MRCR v2 numbers on small/medium inputs. Above threshold, the
+        # filter trims thousands of chunks down to coarse_filter_top_n
+        # so the downstream dense embed + cross-encoder stays bounded.
+        total_chars = sum(len(c) for c in candidates)
+        if (
+            coarse_filter_threshold_chars is not None
+            and total_chars >= coarse_filter_threshold_chars
+            and len(chunks_text) > coarse_filter_top_n
+        ):
+            from longctx.rag.coarse_filter import Chunk, CoarseFilter
+
+            cf_chunks = [
+                Chunk(id=str(i), text=t)
+                for i, t in enumerate(chunks_text)
+            ]
+            # Reuse this pipeline's already-loaded embedder + cache so we
+            # don't pay a second model load. CoarseFilter normally builds
+            # its own bge-small instance; here we inject the existing
+            # encoder via the protected slots (acceptable: same module).
+            cf = CoarseFilter.__new__(CoarseFilter)
+            cf._device = self._device
+            cf._embedder = self._embedder
+            cf._cache = self._cache
+            cf._rrf_k = 60
+            cf._batch_size = 64
+            kept = cf.filter(cf_chunks, query, top_k=coarse_filter_top_n)
+            kept_idx = {int(c.id) for c, _ in kept}
+            chunks_text = [t for i, t in enumerate(chunks_text) if i in kept_idx]
+            chunks_parent = [
+                p for i, p in enumerate(chunks_parent) if i in kept_idx
+            ]
 
         # Query is short and one-shot; never cache it.
         query_emb = self._embedder.encode(

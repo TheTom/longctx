@@ -1,0 +1,42 @@
+[
+  {
+    "tokens": 12000000,
+    "hard": true,
+    "q": 0,
+    "rank": 451,
+    "hit": true,
+    "n_chunks": 6536,
+    "n_kept": 1000,
+    "total_s": 25.32
+  },
+  {
+    "tokens": 12000000,
+    "hard": true,
+    "q": 1,
+    "rank": 13,
+    "hit": true,
+    "n_chunks": 6536,
+    "n_kept": 1000,
+    "total_s": 1.32
+  },
+  {
+    "tokens": 12000000,
+    "hard": true,
+    "q": 2,
+    "rank": 4,
+    "hit": true,
+    "n_chunks": 6536,
+    "n_kept": 1000,
+    "total_s": 1.23
+  },
+  {
+    "tokens": 12000000,
+    "hard": true,
+    "q": 3,
+    "rank": 15,
+    "hit": true,
+    "n_chunks": 6536,
+    "n_kept": 1000,
+    "total_s": 1.26
+  }
+]

@@ -15,9 +15,14 @@ __version__ = "0.2.0"
 
 from longctx.rag.pipeline import RetrievalPipeline
 from longctx.rag.client import LongCtxClient
+from longctx.rag.coarse_filter import Chunk, CoarseFilter
+from longctx.rag.chunker import Chunker
 
 __all__ = [
     "RetrievalPipeline",
     "LongCtxClient",
+    "Chunk",
+    "CoarseFilter",
+    "Chunker",
     "__version__",
 ]

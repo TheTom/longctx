@@ -1,0 +1,163 @@
+[
+  {
+    "id": "Q1_multi_query_fusion",
+    "question": "Where is multi-query paraphrase fusion implemented in longctx? Show me the function and its docstring.",
+    "ground_truth": "longctx/rag/coarse_filter.py \u2014 CoarseFilter.filter_multi_query, added in Phase 6 of the 12M coarse filter work.",
+    "expected_substrings": [
+      "filter_multi_query",
+      "RRF-fuse rankings across multiple"
+    ],
+    "top5": [
+      {
+        "rank": 1,
+        "score": 0.12688,
+        "preview": "# Changelog  ## longctx unreleased \u2014 12M coarse filter (hierarchical-selector pipeline)  Pre-release; lives on `feature/coarse-filter-12m`. Not yet shipped.  ##",
+        "hit_terms": [
+          "filter_multi_query"
+        ]
+      },
+      {
+        "rank": 2,
+        "score": 0.12002,
+        "preview": "ask accuracy needs the full pipeline against MRCR or   a coherent-context bench (see `services/longctx-svc/harness/PRD_coherence_10m.md`). - **Single embedder.*",
+        "hit_terms": [
+          "filter_multi_query",
+          "RRF-fuse rankings across multiple"
+        ]
+      },
+      {
+        "rank": 3,
+        "score": 0.11393,
+        "preview": "s the cache effect is the opposite shape: first query pays full cost, repeat queries on the same corpus are near-instant.  ## Reproduce  ```bash # Single rung p",
+        "hit_terms": [
+          "filter_multi_query"
+        ]
+      },
+      {
+        "rank": 4,
+        "score": 0.11115,
+        "preview": "                    top_k: int = 8,                        prefilter: int = 100,                        use_rerank: bool = True) -> RetrieveResult:         \"\"\"P",
+        "hit_terms": [
+          "filter_multi_query"
+        ]
+      },
+      {
+        "rank": 5,
+        "score": 0.10683,
+        "preview": "     f = _make_filter()     chunks = [         # Alpha-heavy \u2014 dense embedder returns high similarity         _chunk(\"dense_hit\", \"alpha alpha alpha\"),         ",
+        "hit_terms": [
+          "filter_multi_query"
+        ]
+      }
+    ],
+    "verdict": "FOUND",
+    "best_rank": 1,
+    "filter_secs": 14.31
+  },
+  {
+    "id": "Q2_bge_small_decision",
+    "question": "What was the decision rationale for choosing bge-small over MiniLM-L6 as the default embedder in longctx?",
+    "ground_truth": "benchmark/coarse_filter/RESULTS.md \u2014 ablation table: bge-small wins synth hard rank 8, MiniLM-L6 rank 26; on real vault MiniLM-L6 rank 1, bge-small rank 3 (close 2nd).",
+    "expected_substrings": [
+      "bge-small remains the right default",
+      "BAAI/bge-small-en-v1.5",
+      "MiniLM-L6"
+    ],
+    "top5": [
+      {
+        "rank": 1,
+        "score": 0.10599,
+        "preview": "ask accuracy needs the full pipeline against MRCR or   a coherent-context bench (see `services/longctx-svc/harness/PRD_coherence_10m.md`). - **Single embedder.*",
+        "hit_terms": [
+          "bge-small remains the right default",
+          "BAAI/bge-small-en-v1.5",
+          "MiniLM-L6"
+        ]
+      },
+      {
+        "rank": 2,
+        "score": 0.09424,
+        "preview": "# Changelog  ## longctx unreleased \u2014 12M coarse filter (hierarchical-selector pipeline)  Pre-release; lives on `feature/coarse-filter-12m`. Not yet shipped.  ##",
+        "hit_terms": [
+          "bge-small remains the right default",
+          "BAAI/bge-small-en-v1.5",
+          "MiniLM-L6"
+        ]
+      },
+      {
+        "rank": 3,
+        "score": 0.0855,
+        "preview": "grades degrade MRCR-style tasks  Tested four \"obvious upgrade\" interventions on top of a working bi-encoder baseline (MiniLM-L6 + faiss + Qwen2.5-14B-1M generat",
+        "hit_terms": [
+          "MiniLM-L6"
+        ]
+      },
+      {
+        "rank": 4,
+        "score": 0.08361,
+        "preview": ". Score-narrowing experiments (BM25 prefilter, top-K sweeps, oracle gen-ceiling) are in flight; the milestone of \"1M context end-to-end on commodity open stack\"",
+        "hit_terms": [
+          "MiniLM-L6"
+        ]
+      },
+      {
+        "rank": 5,
+        "score": 0.08053,
+        "preview": "(7) for c in cells[1:-1])} | {cells[-1]}\")      print(f\"\\nGen ceiling reference (true oracle on droplet, n=30): 0.849\")   if __name__ == \"__main__\":     main() ",
+        "hit_terms": [
+          "MiniLM-L6"
+        ]
+      }
+    ],
+    "verdict": "FOUND",
+    "best_rank": 1,
+    "filter_secs": 1.6
+  },
+  {
+    "id": "Q3_centroid_threshold",
+    "question": "In mlx-swift-lm, where does the centroid block-sparse attention check whether the context is large enough to switch from dense to sparse?",
+    "ground_truth": "mlx-swift-lm Libraries/MLXLMCommon/CentroidRouter.swift \u2014 BlockSparseConfig.minContextForSparse (default 65536). The gate is checked in each model's attention forward.",
+    "expected_substrings": [
+      "minContextForSparse",
+      "BlockSparseConfig"
+    ],
+    "top5": [
+      {
+        "rank": 1,
+        "score": 0.08175,
+        "preview": "5 Max @ 8K-128K: 2818/86 \u2192 784/51 prefill/decode tok/s \u2014 bandwidth-bound at long ctx, prefill collapses at 128K). Bridge sequential prefill bug audited and fixe",
+        "hit_terms": []
+      },
+      {
+        "rank": 2,
+        "score": 0.08105,
+        "preview": "quartile thresholding + per-(layer, head) k-means \u2192 fully populated CentroidRouter - `releaseScores()` / `releaseAll()` for memory hygiene  **Iter 2 tests (all ",
+        "hit_terms": []
+      },
+      {
+        "rank": 3,
+        "score": 0.07981,
+        "preview": "ask accuracy needs the full pipeline against MRCR or   a coherent-context bench (see `services/longctx-svc/harness/PRD_coherence_10m.md`). - **Single embedder.*",
+        "hit_terms": [
+          "minContextForSparse",
+          "BlockSparseConfig"
+        ]
+      },
+      {
+        "rank": 4,
+        "score": 0.07787,
+        "preview": "ndexed sparse decode attention, V4 variance-aware eviction, ANE-offloaded auxiliary work, streaming TQ at prefill, and ANE-resident speculative decoding into a ",
+        "hit_terms": []
+      },
+      {
+        "rank": 5,
+        "score": 0.07651,
+        "preview": "_top via entropy quartile (Iter 28) layers on top of any preset and typically buys 10\u201320 % on top of uniform K.  ## Memory budget  | Context | KV cache fp16 | K",
+        "hit_terms": []
+      }
+    ],
+    "verdict": "FOUND",
+    "best_rank": 3,
+    "filter_secs": 1.63
+  }
+]

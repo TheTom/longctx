@@ -1,0 +1,442 @@
+{
+  "corpus_stats": [
+    {
+      "path": "/Users/tom/dev/mlx-swift-lm",
+      "files": 350,
+      "chars": 6974557
+    },
+    {
+      "path": "/Users/tom/local_llms/llama.cpp",
+      "files": 1269,
+      "chars": 39823737
+    },
+    {
+      "path": "/Users/tom/dev/vllm-swift",
+      "files": 70,
+      "chars": 823957
+    },
+    {
+      "path": "/Users/tom/Documents/obsidian/Self Study",
+      "files": 1707,
+      "chars": 5947637
+    }
+  ],
+  "total_chars": 53569888,
+  "approx_tokens": 13392472,
+  "n_chunks": 7300,
+  "n_needles": 20,
+  "single_query": {
+    "n": 20,
+    "hits": 20,
+    "misses": 0,
+    "min": 1,
+    "median": 9.5,
+    "p90": 25,
+    "p95": 47,
+    "max": 177,
+    "buckets": {
+      "1-5": 8,
+      "6-10": 2,
+      "11-25": 8,
+      "26-50": 1,
+      "51-100": 0,
+      "101-250": 1,
+      "251-500": 0,
+      "501-1000": 0
+    }
+  },
+  "multi_query": {
+    "n": 20,
+    "hits": 20,
+    "misses": 0,
+    "min": 1,
+    "median": 4.0,
+    "p90": 17,
+    "p95": 41,
+    "max": 108,
+    "buckets": {
+      "1-5": 12,
+      "6-10": 3,
+      "11-25": 3,
+      "26-50": 1,
+      "51-100": 0,
+      "101-250": 1,
+      "251-500": 0,
+      "501-1000": 0
+    }
+  },
+  "by_content_type": {
+    "function_def": {
+      "single": {
+        "n": 4,
+        "hits": 4,
+        "misses": 0,
+        "min": 2,
+        "median": 20.0,
+        "p90": 25,
+        "p95": 25,
+        "max": 177,
+        "buckets": {
+          "1-5": 1,
+          "6-10": 0,
+          "11-25": 2,
+          "26-50": 0,
+          "51-100": 0,
+          "101-250": 1,
+          "251-500": 0,
+          "501-1000": 0
+        }
+      },
+      "multi": {
+        "n": 4,
+        "hits": 4,
+        "misses": 0,
+        "min": 1,
+        "median": 29.0,
+        "p90": 41,
+        "p95": 41,
+        "max": 108,
+        "buckets": {
+          "1-5": 1,
+          "6-10": 0,
+          "11-25": 1,
+          "26-50": 1,
+          "51-100": 0,
+          "101-250": 1,
+          "251-500": 0,
+          "501-1000": 0
+        }
+      }
+    },
+    "prose_paragraph": {
+      "single": {
+        "n": 4,
+        "hits": 4,
+        "misses": 0,
+        "min": 1,
+        "median": 9.5,
+        "p90": 11,
+        "p95": 11,
+        "max": 11,
+        "buckets": {
+          "1-5": 1,
+          "6-10": 1,
+          "11-25": 2,
+          "26-50": 0,
+          "51-100": 0,
+          "101-250": 0,
+          "251-500": 0,
+          "501-1000": 0
+        }
+      },
+      "multi": {
+        "n": 4,
+        "hits": 4,
+        "misses": 0,
+        "min": 1,
+        "median": 7.0,
+        "p90": 10,
+        "p95": 10,
+        "max": 16,
+        "buckets": {
+          "1-5": 2,
+          "6-10": 1,
+          "11-25": 1,
+          "26-50": 0,
+          "51-100": 0,
+          "101-250": 0,
+          "251-500": 0,
+          "501-1000": 0
+        }
+      }
+    },
+    "config_value": {
+      "single": {
+        "n": 4,
+        "hits": 4,
+        "misses": 0,
+        "min": 1,
+        "median": 2.0,
+        "p90": 2,
+        "p95": 2,
+        "max": 3,
+        "buckets": {
+          "1-5": 4,
+          "6-10": 0,
+          "11-25": 0,
+          "26-50": 0,
+          "51-100": 0,
+          "101-250": 0,
+          "251-500": 0,
+          "501-1000": 0
+        }
+      },
+      "multi": {
+        "n": 4,
+        "hits": 4,
+        "misses": 0,
+        "min": 1,
+        "median": 1.0,
+        "p90": 1,
+        "p95": 1,
+        "max": 8,
+        "buckets": {
+          "1-5": 3,
+          "6-10": 1,
+          "11-25": 0,
+          "26-50": 0,
+          "51-100": 0,
+          "101-250": 0,
+          "251-500": 0,
+          "501-1000": 0
+        }
+      }
+    },
+    "code_comment": {
+      "single": {
+        "n": 4,
+        "hits": 4,
+        "misses": 0,
+        "min": 12,
+        "median": 13.5,
+        "p90": 14,
+        "p95": 14,
+        "max": 47,
+        "buckets": {
+          "1-5": 0,
+          "6-10": 0,
+          "11-25": 3,
+          "26-50": 1,
+          "51-100": 0,
+          "101-250": 0,
+          "251-500": 0,
+          "501-1000": 0
+        }
+      },
+      "multi": {
+        "n": 4,
+        "hits": 4,
+        "misses": 0,
+        "min": 3,
+        "median": 3.5,
+        "p90": 4,
+        "p95": 4,
+        "max": 4,
+        "buckets": {
+          "1-5": 4,
+          "6-10": 0,
+          "11-25": 0,
+          "26-50": 0,
+          "51-100": 0,
+          "101-250": 0,
+          "251-500": 0,
+          "501-1000": 0
+        }
+      }
+    },
+    "error_message": {
+      "single": {
+        "n": 4,
+        "hits": 4,
+        "misses": 0,
+        "min": 1,
+        "median": 5.5,
+        "p90": 7,
+        "p95": 7,
+        "max": 22,
+        "buckets": {
+          "1-5": 2,
+          "6-10": 1,
+          "11-25": 1,
+          "26-50": 0,
+          "51-100": 0,
+          "101-250": 0,
+          "251-500": 0,
+          "501-1000": 0
+        }
+      },
+      "multi": {
+        "n": 4,
+        "hits": 4,
+        "misses": 0,
+        "min": 1,
+        "median": 7.5,
+        "p90": 10,
+        "p95": 10,
+        "max": 15,
+        "buckets": {
+          "1-5": 2,
+          "6-10": 1,
+          "11-25": 1,
+          "26-50": 0,
+          "51-100": 0,
+          "101-250": 0,
+          "251-500": 0,
+          "501-1000": 0
+        }
+      }
+    }
+  },
+  "results": [
+    {
+      "marker": "CMT_TOKEN_5M_CODE",
+      "content_type": "code_comment",
+      "target_offset": 5000000,
+      "join_offset": 5000446,
+      "single_rank": 14,
+      "multi_rank": 3
+    },
+    {
+      "marker": "PROSE_TOKEN_5M_PROS",
+      "content_type": "prose_paragraph",
+      "target_offset": 5000000,
+      "join_offset": 5000170,
+      "single_rank": 11,
+      "multi_rank": 16
+    },
+    {
+      "marker": "FN_TOKEN_5M_FUNC",
+      "content_type": "function_def",
+      "target_offset": 5000000,
+      "join_offset": 4999853,
+      "single_rank": 15,
+      "multi_rank": 41
+    },
+    {
+      "marker": "CFG_TOKEN_5M_CONF",
+      "content_type": "config_value",
+      "target_offset": 5000000,
+      "join_offset": 4999708,
+      "single_rank": 3,
+      "multi_rank": 1
+    },
+    {
+      "marker": "ERR_TOKEN_5M_ERRO",
+      "content_type": "error_message",
+      "target_offset": 5000000,
+      "join_offset": 4999537,
+      "single_rank": 7,
+      "multi_rank": 10
+    },
+    {
+      "marker": "ERR_TOKEN_15M_ERRO",
+      "content_type": "error_message",
+      "target_offset": 15000000,
+      "join_offset": 15001210,
+      "single_rank": 22,
+      "multi_rank": 15
+    },
+    {
+      "marker": "CMT_TOKEN_15M_CODE",
+      "content_type": "code_comment",
+      "target_offset": 15000000,
+      "join_offset": 15001134,
+      "single_rank": 13,
+      "multi_rank": 4
+    },
+    {
+      "marker": "FN_TOKEN_15M_FUNC",
+      "content_type": "function_def",
+      "target_offset": 15000000,
+      "join_offset": 14999800,
+      "single_rank": 177,
+      "multi_rank": 108
+    },
+    {
+      "marker": "PROSE_TOKEN_15M_PROS",
+      "content_type": "prose_paragraph",
+      "target_offset": 15000000,
+      "join_offset": 14999777,
+      "single_rank": 11,
+      "multi_rank": 10
+    },
+    {
+      "marker": "CFG_TOKEN_15M_CONF",
+      "content_type": "config_value",
+      "target_offset": 15000000,
+      "join_offset": 14999513,
+      "single_rank": 2,
+      "multi_rank": 8
+    },
+    {
+      "marker": "ERR_TOKEN_30M_ERRO",
+      "content_type": "error_message",
+      "target_offset": 30000000,
+      "join_offset": 30000512,
+      "single_rank": 1,
+      "multi_rank": 1
+    },
+    {
+      "marker": "CFG_TOKEN_30M_CONF",
+      "content_type": "config_value",
+      "target_offset": 30000000,
+      "join_offset": 30000447,
+      "single_rank": 1,
+      "multi_rank": 1
+    },
+    {
+      "marker": "PROSE_TOKEN_30M_PROS",
+      "content_type": "prose_paragraph",
+      "target_offset": 30000000,
+      "join_offset": 30000350,
+      "single_rank": 1,
+      "multi_rank": 1
+    },
+    {
+      "marker": "FN_TOKEN_30M_FUNC",
+      "content_type": "function_def",
+      "target_offset": 30000000,
+      "join_offset": 30000018,
+      "single_rank": 2,
+      "multi_rank": 1
+    },
+    {
+      "marker": "CMT_TOKEN_30M_CODE",
+      "content_type": "code_comment",
+      "target_offset": 30000000,
+      "join_offset": 29999492,
+      "single_rank": 47,
+      "multi_rank": 4
+    },
+    {
+      "marker": "ERR_TOKEN_45M_ERRO",
+      "content_type": "error_message",
+      "target_offset": 45000000,
+      "join_offset": 45000465,
+      "single_rank": 4,
+      "multi_rank": 5
+    },
+    {
+      "marker": "CMT_TOKEN_45M_CODE",
+      "content_type": "code_comment",
+      "target_offset": 45000000,
+      "join_offset": 45000439,
+      "single_rank": 12,
+      "multi_rank": 3
+    },
+    {
+      "marker": "PROSE_TOKEN_45M_PROS",
+      "content_type": "prose_paragraph",
+      "target_offset": 45000000,
+      "join_offset": 45000149,
+      "single_rank": 8,
+      "multi_rank": 4
+    },
+    {
+      "marker": "FN_TOKEN_45M_FUNC",
+      "content_type": "function_def",
+      "target_offset": 45000000,
+      "join_offset": 44999868,
+      "single_rank": 25,
+      "multi_rank": 17
+    },
+    {
+      "marker": "CFG_TOKEN_45M_CONF",
+      "content_type": "config_value",
+      "target_offset": 45000000,
+      "join_offset": 44999668,
+      "single_rank": 2,
+      "multi_rank": 1
+    }
+  ]
+}

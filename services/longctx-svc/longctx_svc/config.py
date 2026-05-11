@@ -114,6 +114,13 @@ class Limits:
     multiquery_min_chunks: int = 1000
     rerank_prefilter_small: int = 20   # cross-encoder pairs for <10k chunks
     rerank_prefilter_large: int = 100  # cross-encoder pairs at scale
+    # BM25 + dense RRF coarse-filter fusion. Off by default — costs an
+    # extra BM25 index build (~50ms/1k chunks) and a per-query rank pass.
+    # Worth it on huge scopes where rare-term queries (identifiers, codes,
+    # names) lose to cosine alone. Mirrors longctx.rag.coarse_filter
+    # plumbing; see docs/PRD-12m-coarse-filter.md.
+    coarse_filter_min_chunks: int = 5000
+    rrf_k: int = 60
     # Max tokens to ever splice into a request. 50-line code chunks at
     # ~30 tok/line × 8 = 12K tokens — blows out small-context windows.
     # Approximated as chars/4 (English ~4 chars/tok). Truncate longest
@@ -129,6 +136,9 @@ class Limits:
                 "LONGCTX_MAX_HOT", cls.max_files_hot)),
             max_files_package=int(os.environ.get(
                 "LONGCTX_MAX_PACKAGE", cls.max_files_package)),
+            coarse_filter_min_chunks=int(os.environ.get(
+                "LONGCTX_COARSE_FILTER_MIN_CHUNKS",
+                cls.coarse_filter_min_chunks)),
         )
 
 
@@ -147,6 +157,8 @@ class ServiceConfig:
         "LONGCTX_MULTIQUERY", "1") == "1")
     use_treesitter: bool = field(default_factory=lambda: os.environ.get(
         "LONGCTX_TS", "0") == "1")
+    use_coarse_filter: bool = field(default_factory=lambda: os.environ.get(
+        "LONGCTX_COARSE_FILTER", "0") == "1")
     limits: Limits = field(default_factory=Limits.from_env)
 
 

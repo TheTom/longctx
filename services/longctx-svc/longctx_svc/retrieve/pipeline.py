@@ -4,18 +4,39 @@ Default recipe (validated 2026-05-06 on MRCR v2 1M, n=80):
   multi-query (4 template paraphrases) → cosine top-100 union →
   bge-reranker-v2-m3 → top-K.
 
-Multi-query and rerank can each be disabled via config.
+Multi-query and rerank can each be disabled via config. An optional
+BM25 + dense RRF coarse-filter fusion lane fires when the scope is
+huge (≥`coarse_filter_min_chunks`) and `use_coarse_filter=True` —
+mirrors `longctx.rag.coarse_filter` plumbing for catching rare-term
+queries (identifiers, codes, names) that lose to cosine alone. See
+docs/PRD-12m-coarse-filter.md.
 """
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from weakref import WeakKeyDictionary
 
 import numpy as np
 
 from longctx_svc.config import get_config
 from longctx_svc.indexer.builder import ScopeIndex
 from longctx_svc.indexer.chunker import Chunk
+
+# Tokenizer for BM25 — word-level lowercasing, identical recipe to
+# longctx.rag.coarse_filter._word_tokenize. Subword tokenization would
+# over-shard code identifiers and break term-frequency counts.
+_BM25_WORD_RE = re.compile(r"\w+")
+
+
+def _bm25_tokenize(text: str) -> list[str]:
+    return _BM25_WORD_RE.findall(text.lower())
+
+
+def _rrf_score(rank: int, k: int) -> float:
+    """Reciprocal-rank-fusion score for one ranking source. ``rank`` is
+    1-indexed; standard k=60 from Cormack/Clarke/Buettcher 2009."""
+    return 1.0 / (k + rank)
 
 
 @dataclass(frozen=True)
@@ -26,6 +47,7 @@ class RetrieveResult:
     query: str
     paraphrases: list[str]      # the queries that were embedded (incl. original)
     used_rerank: bool
+    used_coarse_filter: bool = False   # BM25 ⊕ dense RRF fusion lane
 
 
 # Generic paraphrase templates — work for code, prose, and config queries.
@@ -57,7 +79,8 @@ class RetrievePipeline:
 
     def __init__(self, embedder=None, reranker=None,
                  use_multi_query: bool | None = None,
-                 n_paraphrases: int = 3):
+                 n_paraphrases: int = 3,
+                 use_coarse_filter: bool | None = None):
         cfg = get_config()
         self._embedder = embedder
         self._reranker = reranker
@@ -66,6 +89,15 @@ class RetrievePipeline:
             cfg.use_multi_query if use_multi_query is None else use_multi_query
         )
         self.n_paraphrases = n_paraphrases
+        self.use_coarse_filter = (
+            cfg.use_coarse_filter
+            if use_coarse_filter is None else use_coarse_filter
+        )
+        # Lazy per-ScopeIndex BM25 cache. Weak-keyed so eviction of an
+        # index also drops its BM25 structure without explicit cleanup.
+        # Keyed by id(index) since ScopeIndex is a mutable dataclass and
+        # we want strict identity equality.
+        self._bm25_cache: dict[int, object] = {}
 
     def _ensure_embedder(self):
         if self._embedder is None:
@@ -103,6 +135,7 @@ class RetrievePipeline:
             return RetrieveResult(
                 chunks=[], scores=[], query=query,
                 paraphrases=[query], used_rerank=False,
+                used_coarse_filter=False,
             )
         per_scope = []
         for idx in indexes:
@@ -118,17 +151,38 @@ class RetrievePipeline:
                 all_pairs.append((float(s), c))
         all_pairs.sort(key=lambda p: -p[0])
         picks = all_pairs[:top_k]
+        used_coarse_filter = any(r.used_coarse_filter for r in per_scope)
         return RetrieveResult(
             chunks=[c for _, c in picks],
             scores=[s for s, _ in picks],
             query=query,
             paraphrases=paraphrases,
             used_rerank=used_rerank,
+            used_coarse_filter=used_coarse_filter,
         )
+
+    def _get_or_build_bm25(self, index: ScopeIndex):
+        """Lazy per-index BM25Okapi. Built on first call, cached by
+        identity, invalidated whenever the chunk count changes (a quick
+        heuristic that catches add/remove without watching every field).
+        """
+        from rank_bm25 import BM25Okapi
+
+        key = id(index)
+        cached = self._bm25_cache.get(key)
+        if cached is not None:
+            bm25, n_seen = cached
+            if n_seen == len(index.chunks):
+                return bm25
+        corpus_tokens = [_bm25_tokenize(c.text) for c in index.chunks]
+        bm25 = BM25Okapi(corpus_tokens) if corpus_tokens else None
+        self._bm25_cache[key] = (bm25, len(index.chunks))
+        return bm25
 
     def retrieve(self, query: str, index: ScopeIndex, top_k: int = 8,
                  prefilter: int = 100,
-                 use_rerank: bool = True) -> RetrieveResult:
+                 use_rerank: bool = True,
+                 use_coarse_filter: bool | None = None) -> RetrieveResult:
         """Multi-query + rerank retrieval over a ScopeIndex.
 
         Scale-aware: at small scope sizes (<rerank_min_chunks) the rerank
@@ -136,11 +190,18 @@ class RetrievePipeline:
         cross-encoder costs ~5s on CPU). Multi-query is similarly skipped
         when chunks < multiquery_min_chunks. Override per-call by passing
         use_rerank=True/False explicitly.
+
+        ``use_coarse_filter`` (default config-driven) enables a BM25 +
+        dense RRF fusion lane that fires when the scope is huge
+        (≥`coarse_filter_min_chunks`). Catches rare-term queries that
+        cosine alone misses; cost is one BM25 build per index +
+        per-query rank pass.
         """
         if index.embeddings is None or len(index.chunks) == 0:
             return RetrieveResult(
                 chunks=[], scores=[], query=query,
                 paraphrases=[query], used_rerank=False,
+                used_coarse_filter=False,
             )
         cfg = get_config()
         n_chunks = len(index.chunks)
@@ -171,7 +232,49 @@ class RetrievePipeline:
                          if n_chunks >= 10_000
                          else cfg.limits.rerank_prefilter_small)
         cos_top_n = min(prefilter, len(index.chunks))
-        cos_top = np.argsort(-max_sims)[:cos_top_n].tolist()
+
+        # Scale-aware coarse filter: BM25 ⊕ dense RRF fusion. Mirrors
+        # longctx.rag.coarse_filter.filter_multi_query — runs BM25 over
+        # the same paraphrases that drove the cosine pass and fuses
+        # ranks via RRF. Catches rare-term queries (identifiers, codes,
+        # names) that cosine alone misses. Off below the threshold so
+        # we don't perturb established MRCR v2 numbers on small/medium
+        # scopes.
+        do_coarse_filter = (
+            (use_coarse_filter
+             if use_coarse_filter is not None else self.use_coarse_filter)
+            and n_chunks >= cfg.limits.coarse_filter_min_chunks
+        )
+        used_coarse_filter = False
+        if do_coarse_filter:
+            bm25 = self._get_or_build_bm25(index)
+            if bm25 is not None:
+                # Cosine ranks (1-indexed by descending similarity)
+                cos_order = np.argsort(-max_sims)
+                cos_rank = np.empty(n_chunks, dtype=np.int64)
+                cos_rank[cos_order] = np.arange(1, n_chunks + 1)
+                # BM25 ranks across paraphrases — keep the best (lowest)
+                # rank each chunk earns from any paraphrase.
+                bm25_best_rank = np.full(n_chunks, n_chunks + 1,
+                                         dtype=np.int64)
+                for p in paraphrases:
+                    qt = _bm25_tokenize(p)
+                    if not qt:
+                        continue
+                    scores = bm25.get_scores(qt)
+                    order = np.argsort(-scores)
+                    rank = np.empty(n_chunks, dtype=np.int64)
+                    rank[order] = np.arange(1, n_chunks + 1)
+                    np.minimum(bm25_best_rank, rank, out=bm25_best_rank)
+                # RRF fuse cosine + BM25
+                k = cfg.limits.rrf_k
+                fused = (1.0 / (k + cos_rank)) + (1.0 / (k + bm25_best_rank))
+                cos_top = np.argsort(-fused)[:cos_top_n].tolist()
+                used_coarse_filter = True
+            else:
+                cos_top = np.argsort(-max_sims)[:cos_top_n].tolist()
+        else:
+            cos_top = np.argsort(-max_sims)[:cos_top_n].tolist()
 
         # Scale-aware rerank gate. The cross-encoder is the dominant
         # latency at small scope sizes — cosine alone is already strong
@@ -208,4 +311,5 @@ class RetrievePipeline:
             query=query,
             paraphrases=paraphrases,
             used_rerank=used_rerank,
+            used_coarse_filter=used_coarse_filter,
         )
