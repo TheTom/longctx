@@ -766,3 +766,126 @@ def test_result_chunks_contain_text():
     searcher = _build_searcher(store, embeds, embedder)
     result = searcher.search("needle", cwd="/tmp/longctx")
     assert result.chunks[0].text == "needle in haystack"
+
+
+# ------------------------------------------- auto-policy + retrieval signals
+
+class TestAutoPolicyAndSignals:
+    """The Phase 3 wiring: auto_policy flag + new SearchResult fields
+    (query_shape, applied_policy_rationale, embedder_hint,
+    retrieval_quality)."""
+
+    def test_query_shape_always_populated_default_off(self):
+        """Without auto_policy, query_shape still gets classified."""
+        chunks = [(1, 1, "longctx", "needle planted here")]
+        store, embeds, embedder = _build_corpus(chunks)
+        searcher = _build_searcher(store, embeds, embedder)
+        result = searcher.search(
+            "explain the needle", cwd="/tmp/longctx",
+        )
+        assert result.query_shape == "prose"
+
+    def test_query_shape_symbolic_query(self):
+        chunks = [(1, 1, "longctx", "needle here")]
+        store, embeds, embedder = _build_corpus(chunks)
+        searcher = _build_searcher(store, embeds, embedder)
+        result = searcher.search(
+            "getUserById", cwd="/tmp/longctx",
+        )
+        assert result.query_shape == "symbolic"
+
+    def test_query_shape_unknown_for_short_input(self):
+        chunks = [(1, 1, "longctx", "x y z")]
+        store, embeds, embedder = _build_corpus(chunks)
+        searcher = _build_searcher(store, embeds, embedder)
+        result = searcher.search("hi", cwd="/tmp/longctx")
+        assert result.query_shape == "unknown"
+
+    def test_auto_policy_off_no_rationale(self):
+        """Default behavior: no rationale, no embedder hint."""
+        chunks = [(1, 1, "longctx", "needle here")]
+        store, embeds, embedder = _build_corpus(chunks)
+        searcher = _build_searcher(store, embeds, embedder)
+        result = searcher.search(
+            "explain the needle", cwd="/tmp/longctx",
+        )
+        assert result.applied_policy_rationale == ""
+        assert result.embedder_hint == ""
+
+    def test_auto_policy_on_surfaces_rationale(self):
+        """auto_policy=True populates rationale + embedder_hint when
+        the policy table has an entry for the (size, shape) cell."""
+        chunks = [(1, 1, "longctx", "the needle planted here")]
+        store, embeds, embedder = _build_corpus(chunks)
+        searcher = _build_searcher(store, embeds, embedder)
+        result = searcher.search(
+            "explain the planted needle",  # PROSE
+            cwd="/tmp/longctx",
+            auto_policy=True,
+        )
+        # PROSE × SHORT cell hints at bge-m3 + has rationale text
+        assert result.embedder_hint == "BAAI/bge-m3"
+        assert "prose" in result.applied_policy_rationale.lower()
+
+    def test_retrieval_quality_high_when_strong_match(self):
+        """Top-1 cosine ≥ 0.75 + gap ≥ 0.10 → high."""
+        chunks = [
+            (1, 1, "longctx", "needle planted exactly here"),
+            (2, 2, "longctx", "totally unrelated text"),
+        ]
+        store, embeds, embedder = _build_corpus(chunks)
+        searcher = _build_searcher(store, embeds, embedder)
+        result = searcher.search("needle", cwd="/tmp/longctx")
+        # Keyword embedder gives a clean 1.0 cosine for "needle" vs
+        # planted-needle text, vs ~0 for unrelated
+        assert result.retrieval_quality in {"high", "medium"}
+
+    def test_compute_retrieval_quality_thresholds(self):
+        """Unit-test the retrieval_quality classifier directly with
+        crafted (top1_cosine, gap, no_rel, n_chunks) inputs — avoids
+        the keyword-embedder's saturate-at-1 quirk."""
+        chunks = [(1, 1, "longctx", "x")]
+        store, embeds, embedder = _build_corpus(chunks)
+        searcher = _build_searcher(store, embeds, embedder)
+        # abstain takes priority over everything else
+        assert searcher._compute_retrieval_quality(
+            top1_cosine=0.9, confidence_gap=0.5,
+            no_relevant_results=True, n_chunks=0,
+        ) == "abstain"
+        # high tier: cos ≥ 0.75 AND gap ≥ 0.10
+        assert searcher._compute_retrieval_quality(
+            top1_cosine=0.80, confidence_gap=0.15,
+            no_relevant_results=False, n_chunks=3,
+        ) == "high"
+        # medium tier: cos ≥ 0.60
+        assert searcher._compute_retrieval_quality(
+            top1_cosine=0.62, confidence_gap=0.02,
+            no_relevant_results=False, n_chunks=3,
+        ) == "medium"
+        # medium tier: cos ≥ 0.50 + strong gap
+        assert searcher._compute_retrieval_quality(
+            top1_cosine=0.55, confidence_gap=0.20,
+            no_relevant_results=False, n_chunks=3,
+        ) == "medium"
+        # low tier: weak cosine, weak gap
+        assert searcher._compute_retrieval_quality(
+            top1_cosine=0.45, confidence_gap=0.05,
+            no_relevant_results=False, n_chunks=3,
+        ) == "low"
+        # unknown: no chunks but floor didn't fire
+        assert searcher._compute_retrieval_quality(
+            top1_cosine=0.0, confidence_gap=0.0,
+            no_relevant_results=False, n_chunks=0,
+        ) == "unknown"
+
+    def test_retrieval_quality_unknown_when_no_chunks_no_floor(self):
+        """Empty result without floor firing → retrieval_quality=unknown."""
+        # Empty corpus
+        store, embeds, embedder = _build_corpus([])
+        config = SearcherConfig(relevance_floor=0.0)  # disabled
+        searcher = _build_searcher(
+            store, embeds, embedder, config=config,
+        )
+        result = searcher.search("needle", cwd="/tmp/longctx")
+        assert result.no_relevant_results is False
+        assert result.retrieval_quality == "unknown"

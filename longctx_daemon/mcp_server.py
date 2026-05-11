@@ -159,6 +159,12 @@ _SEARCH_CODEBASE_SCHEMA: dict[str, Any] = {
         # relevance floor. Top-1 cosine below this returns empty
         # chunks + no_relevant_results=True. 0 disables.
         "relevance_floor": {"type": ["number", "null"]},
+        # Phase 3: opt into context-size + query-shape adaptive
+        # routing. When True, the searcher detects query shape +
+        # estimates corpus size, looks up the policy table, and
+        # overrides retrieval weights for THIS call. Surfaces
+        # rationale + embedder hint on the response.
+        "auto_policy": {"type": "boolean", "default": False},
     },
     "required": ["query"],
     "additionalProperties": False,
@@ -580,6 +586,7 @@ class MCPServer:
         max_results = args.get("max_results")
         wait_ms = args.get("wait_for_quiescence_ms")
         relevance_floor = args.get("relevance_floor")
+        auto_policy = bool(args.get("auto_policy", False))
 
         # Sticky session: when caller didn't pass project= or cwd, use
         # the session's set_active_project value (PRD §3.4 / §3.9). The
@@ -596,6 +603,7 @@ class MCPServer:
                 wait_ms=wait_ms,
                 relevance_floor=relevance_floor,
                 sticky=sticky,
+                auto_policy=auto_policy,
             )
 
         # ---------- single-string path (Phase 2.0 contract) ----------
@@ -611,12 +619,15 @@ class MCPServer:
             kwargs["active_project_sticky"] = sticky
         if relevance_floor is not None:
             kwargs["relevance_floor"] = relevance_floor
+        if auto_policy:
+            kwargs["auto_policy"] = True
         try:
             result = self.searcher.search(**kwargs)
         except TypeError:
             # Older fakes don't take new kwargs — drop them progressively.
             kwargs.pop("active_project_sticky", None)
             kwargs.pop("relevance_floor", None)
+            kwargs.pop("auto_policy", None)
             result = self.searcher.search(**kwargs)
         if asyncio.iscoroutine(result):
             result = await result
@@ -662,6 +673,16 @@ class MCPServer:
                 result, "query_type", "natural_language",
             ),
             "confidence_gap": getattr(result, "confidence_gap", 0.0),
+            # Phase 3 honest-retrieval signals (auto-policy +
+            # retrieval_quality):
+            "query_shape": getattr(result, "query_shape", "unknown"),
+            "applied_policy_rationale": getattr(
+                result, "applied_policy_rationale", "",
+            ),
+            "embedder_hint": getattr(result, "embedder_hint", ""),
+            "retrieval_quality": getattr(
+                result, "retrieval_quality", "unknown",
+            ),
         }
 
         scope_dict = response["scope_decision"]
@@ -694,6 +715,7 @@ class MCPServer:
         wait_ms: Optional[int],
         relevance_floor: Optional[float],
         sticky: Optional[str],
+        auto_policy: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
         """Phase 2.0.1 multi-question path.
 
@@ -719,12 +741,15 @@ class MCPServer:
             kwargs["active_project_sticky"] = sticky
         if relevance_floor is not None:
             kwargs["relevance_floor"] = relevance_floor
+        if auto_policy:
+            kwargs["auto_policy"] = True
 
         multi: Optional[Any] = None
         if hasattr(self.searcher, "search_multi"):
             try:
                 multi = self.searcher.search_multi(**kwargs)
             except TypeError:
+                kwargs.pop("auto_policy", None)
                 kwargs.pop("relevance_floor", None)
                 kwargs.pop("active_project_sticky", None)
                 try:
@@ -750,11 +775,14 @@ class MCPServer:
                     kw["active_project_sticky"] = sticky
                 if relevance_floor is not None:
                     kw["relevance_floor"] = relevance_floor
+                if auto_policy:
+                    kw["auto_policy"] = True
                 try:
                     r = self.searcher.search(**kw)
                 except TypeError:
                     kw.pop("active_project_sticky", None)
                     kw.pop("relevance_floor", None)
+                    kw.pop("auto_policy", None)
                     r = self.searcher.search(**kw)
                 if asyncio.iscoroutine(r):
                     r = await r
@@ -780,6 +808,14 @@ class MCPServer:
                 ),
                 "query_type": getattr(g, "query_type", "natural_language"),
                 "confidence_gap": getattr(g, "confidence_gap", 0.0),
+                "query_shape": getattr(g, "query_shape", "unknown"),
+                "applied_policy_rationale": getattr(
+                    g, "applied_policy_rationale", "",
+                ),
+                "embedder_hint": getattr(g, "embedder_hint", ""),
+                "retrieval_quality": getattr(
+                    g, "retrieval_quality", "unknown",
+                ),
             })
 
         # Shared fields: take the first group's scope; worst-case

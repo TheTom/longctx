@@ -169,6 +169,44 @@ class SearchResult:
     near zero = top results are tied / a coin flip and the agent
     should treat ranking as low-information. 0.0 when fewer than two
     chunks were considered."""
+    query_shape: str = "unknown"
+    """Coarse shape of the query for policy routing — one of
+    ``unknown`` / ``symbolic`` / ``prose`` / ``mixed``. Always
+    populated (cheap regex). Drives auto-policy routing when
+    ``auto_policy=True`` was passed to ``search()``; otherwise
+    purely informational so callers can render the heuristic
+    classification in their UI."""
+    applied_policy_rationale: str = ""
+    """When ``auto_policy=True`` was passed, the human-readable
+    rationale string from the selected ``RetrievalPolicy``
+    (e.g. ``"prose short — dense-only with bge-m3"``). Empty when
+    auto-policy was off, the production default was used, or the
+    policy table had no entry for the (size, shape) cell."""
+    embedder_hint: str = ""
+    """Advisory: the embedder the auto-policy router thinks would
+    work best for this (corpus, query) cell. The daemon does NOT
+    swap embedders mid-call — switching requires re-indexing — so
+    this is a recommendation the agent / orchestration layer can
+    act on. Empty when no hint applies."""
+    retrieval_quality: str = "unknown"
+    """Confidence summary derived from ``top1_dense_cosine`` +
+    ``confidence_gap`` + ``no_relevant_results``. One of:
+
+      * ``"abstain"`` — no_relevant_results=True; relevance floor
+        fired; agent should NOT cite these chunks.
+      * ``"high"`` — top1 cosine ≥ 0.75 AND confidence_gap ≥ 0.10;
+        the rank-1 chunk dominates clearly.
+      * ``"medium"`` — top1 cosine ≥ 0.60 OR (≥ 0.50 with strong
+        gap); usable but agent should consider widening K or
+        cross-checking.
+      * ``"low"`` — top1 cosine < 0.60 with no big gap; chunks
+        present but probably weak. Agent should fall back to
+        grep / LSP for completeness-required tasks.
+      * ``"unknown"`` — no chunks considered (BM25-only with
+        dense_weight=0, or empty corpus).
+
+    Thresholds eyeballed from dogfood-audit data; per-corpus
+    calibration via ``longctx calibrate`` may override later."""
 
 
 @dataclass(frozen=True)

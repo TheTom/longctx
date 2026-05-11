@@ -88,6 +88,39 @@ DEFAULT_TOP_K = 8
 DEFAULT_BINS = ("8K", "32K", "64K")
 DEFAULT_RERANKER = "BAAI/bge-reranker-v2-m3"
 
+
+def _apply_auto_policy(args, sample: Optional["MRCRSample"] = None):
+    """Apply the auto-policy router to ``args`` IN PLACE.
+
+    Looks up a ``RetrievalPolicy`` for (corpus-size, query-shape) and
+    overrides the relevant CLI args (``bm25_weight``, ``dense_weight``,
+    ``chunk_tokens``, ``rerank``, ``rerank_pre_k``). Embedder /
+    generator hints surface as warnings but are NOT applied — the CLI
+    can't swap models on the fly without restart.
+
+    Use ``sample`` (per-sample dispatch) when each MRCR sample has a
+    different ``n_chars``. Without ``sample`` we default to a typical
+    32K conversation (sane fallback for smoke runs).
+    """
+    from longctx_daemon.policy import (
+        QueryShape, detect_query_shape, select_policy,
+    )
+    if sample is not None:
+        size = sample.n_chars
+        shape = detect_query_shape(sample.query)
+    else:
+        size = 64_000  # sane fallback ≈ 32K bin midpoint
+        shape = QueryShape.UNKNOWN
+    policy = select_policy(corpus_size_chars=size, query_shape=shape)
+    args.bm25_weight = policy.bm25_weight
+    args.dense_weight = policy.dense_weight
+    if policy.chunk_tokens is not None:
+        args.chunk_tokens = policy.chunk_tokens
+    if policy.rerank_pre_k is not None:
+        args.rerank = True
+        args.rerank_pre_k = policy.rerank_pre_k
+    return policy
+
 # AMD-recipe defaults — see "Open Sparse Stack — RAG Beats SubQ".
 DEFAULT_BASELINE_EMBEDDER = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_LONGCTX_EMBEDDER = "BAAI/bge-small-en-v1.5"
@@ -1062,6 +1095,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="longctx-only: RRF BM25 weight (0 = disable)")
     parser.add_argument("--dense-weight", type=float, default=1.0,
                         help="longctx-only: RRF dense weight (0 = disable)")
+    parser.add_argument("--auto-policy", action="store_true",
+                        help="Per-sample, look up the (corpus-size, "
+                             "query-shape) policy in longctx_daemon.policy "
+                             "and override --bm25-weight, --dense-weight, "
+                             "--chunk-tokens, --rerank, and --rerank-pre-k. "
+                             "Embedder/generator hints surface as warnings "
+                             "but are NOT swapped (would require restart).")
     parser.add_argument("--bins", default=",".join(DEFAULT_BINS),
                         help=f"comma-separated bin labels from "
                              f"{sorted(BINS_BY_CHAR)}")
@@ -1101,6 +1141,49 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         samples_per_bin: Any = json.loads(args.samples_json)
     else:
         samples_per_bin = args.samples
+
+    if args.auto_policy:
+        # Pick a representative size by taking the midpoint of the
+        # smallest bin in --bins (conservative — biases toward
+        # symbolic-friendly hybrid retrieval if multiple bins span
+        # short and long).
+        from longctx_daemon.policy import (
+            QueryShape, select_policy,
+        )
+        smallest_bin = min(
+            (b for b in bins if b in BINS_BY_CHAR),
+            key=lambda b: BINS_BY_CHAR[b][0],
+            default="32K",
+        )
+        lo, hi = BINS_BY_CHAR[smallest_bin]
+        rep_size = (lo + hi) // 2
+        # MRCR is prose-disambiguation by construction.
+        pol = select_policy(
+            corpus_size_chars=rep_size, query_shape=QueryShape.PROSE,
+        )
+        print(
+            f"[auto-policy] bin={smallest_bin} (chars≈{rep_size}) "
+            f"shape=PROSE → bm25={pol.bm25_weight} "
+            f"dense={pol.dense_weight} chunk_tokens={pol.chunk_tokens} "
+            f"rerank_pre_k={pol.rerank_pre_k}",
+            file=sys.stderr,
+        )
+        if pol.embedder_hint:
+            print(
+                f"[auto-policy] embedder_hint: {pol.embedder_hint} "
+                f"(NOT swapped automatically — set --embedder to apply)",
+                file=sys.stderr,
+            )
+        if pol.rationale:
+            print(f"[auto-policy] rationale: {pol.rationale}",
+                  file=sys.stderr)
+        args.bm25_weight = pol.bm25_weight
+        args.dense_weight = pol.dense_weight
+        if pol.chunk_tokens is not None:
+            args.chunk_tokens = pol.chunk_tokens
+        if pol.rerank_pre_k is not None:
+            args.rerank = True
+            args.rerank_pre_k = pol.rerank_pre_k
 
     retriever = _build_retriever(
         args.retriever, embedder=args.embedder, chunk_tokens=args.chunk_tokens,

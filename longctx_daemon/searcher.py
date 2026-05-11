@@ -498,6 +498,7 @@ class Searcher:
         active_project_sticky: Optional[str] = None,
         paraphrases: tuple[str, ...] = (),
         relevance_floor: Optional[float] = None,
+        auto_policy: bool = False,
     ) -> SearchResult:
         """Run one search end-to-end and return a ``SearchResult``.
 
@@ -518,7 +519,27 @@ class Searcher:
         top-1 cosine falls below it, ``chunks`` returns empty and
         ``no_relevant_results=True`` so the agent knows the corpus
         had nothing for this question.
+
+        ``auto_policy`` opts into the context-size + query-shape
+        adaptive router (``longctx_daemon.policy``). When True, the
+        searcher detects the query's shape (symbolic / prose / mixed),
+        estimates corpus size from the chunk store, looks up the
+        ``RetrievalPolicy`` for that cell, and overrides
+        ``bm25_weight`` / ``dense_weight`` for THIS call. The policy's
+        rationale + embedder hint are surfaced on the result so the
+        caller can see why this stack was picked. Default False keeps
+        production behavior unchanged.
         """
+        # Per-call policy resolution. ``query_shape`` is always
+        # populated (cheap regex); the *_weight overrides only apply
+        # when ``auto_policy`` was opted into.
+        (
+            effective_bm25_weight,
+            effective_dense_weight,
+            policy_rationale,
+            embedder_hint_text,
+            query_shape_str,
+        ) = self._resolve_policy(query=query, auto_policy=auto_policy)
         # ---- Stage: scope decision (cheap, but timed for completeness)
         projects = self._list_indexed_projects()
         scope = decide_scope(
@@ -553,7 +574,7 @@ class Searcher:
         # ---- Stage: bm25_score
         bm25_rankings: list[tuple[Hit, ...]] = []
         t0 = time.perf_counter()
-        if self._config.bm25_weight > 0:
+        if effective_bm25_weight > 0:
             for q in queries:
                 terms = _word_tokenize(q)
                 if not terms:
@@ -567,7 +588,7 @@ class Searcher:
         # ---- Stage: dense_score
         dense_rankings: list[tuple[Hit, ...]] = []
         t0 = time.perf_counter()
-        if self._config.dense_weight > 0:
+        if effective_dense_weight > 0:
             scope_embedding_rows = self._scope_to_embedding_rows(scope)
             raw_dense_rankings: list[tuple[Hit, ...]] = []
             for emb in query_embs:
@@ -603,7 +624,11 @@ class Searcher:
 
         # ---- Stage: rrf_fuse
         t0 = time.perf_counter()
-        fused = self._rrf_fuse(bm25_rankings, dense_rankings)
+        fused = self._rrf_fuse(
+            bm25_rankings, dense_rankings,
+            bm25_weight=effective_bm25_weight,
+            dense_weight=effective_dense_weight,
+        )
         # Cap the post-fusion list at top_n so we don't pay for
         # materializing chunks that won't make it past the token budget.
         cap = max_results if max_results is not None else top_n
@@ -661,7 +686,7 @@ class Searcher:
         )
         no_relevant_results = (
             floor > 0.0
-            and self._config.dense_weight > 0
+            and effective_dense_weight > 0
             and (not fused or top1_cosine < floor)
         )
 
@@ -732,6 +757,11 @@ class Searcher:
             total=total_ms,
         )
 
+        retrieval_quality = self._compute_retrieval_quality(
+            top1_cosine=top1_cosine, confidence_gap=confidence_gap,
+            no_relevant_results=no_relevant_results,
+            n_chunks=len(kept),
+        )
         return SearchResult(
             chunks=tuple(sc for _, sc in kept),
             freshness=freshness,
@@ -741,6 +771,10 @@ class Searcher:
             top1_dense_cosine=top1_cosine,
             query_type=query_type,
             confidence_gap=confidence_gap,
+            query_shape=query_shape_str,
+            applied_policy_rationale=policy_rationale,
+            embedder_hint=embedder_hint_text,
+            retrieval_quality=retrieval_quality,
         )
 
     # ---------------------------------------------------- multi-question API
@@ -881,6 +915,79 @@ class Searcher:
             return ScopeFilter(project=fanout[0])
         return ScopeFilter(project_in=fanout)
 
+    def _resolve_policy(
+        self, *, query: str, auto_policy: bool,
+    ) -> tuple[float, float, str, str, str]:
+        """Compute the per-call (bm25_weight, dense_weight, rationale,
+        embedder_hint, query_shape_str) for one search invocation.
+
+        ``query_shape`` is always detected (cheap regex) and surfaced
+        on the result so callers can render the heuristic
+        classification regardless of whether they opted into auto-
+        policy. The weight overrides only apply when ``auto_policy``
+        is True.
+
+        Corpus-size estimate uses ``chunk_count() × ~8000 chars``
+        (rough average for a 2K-token chunk × 4 chars/token). Good
+        enough for size bucketing.
+        """
+        from longctx_daemon.policy import (
+            QueryShape, detect_query_shape, select_policy,
+        )
+        shape = detect_query_shape(query)
+        shape_str = shape.value
+        if not auto_policy:
+            return (
+                self._config.bm25_weight,
+                self._config.dense_weight,
+                "",   # no policy applied
+                "",   # no embedder hint
+                shape_str,
+            )
+        # Cheap corpus-size estimate. Skips a SQLite count when
+        # the chunk store doesn't expose ``chunk_count()`` (defensive
+        # against custom Protocol impls in tests).
+        corpus_chars = 0
+        try:
+            cc = self._chunk_store.chunk_count()
+            # Average chunk size ≈ 2K tokens × 4 chars/token = 8000.
+            # Conservative; over-estimates rather than under so we
+            # don't accidentally pick the SHORT bucket for a real
+            # codebase that's just under the 64K threshold.
+            corpus_chars = cc * 8000
+        except Exception:  # noqa: BLE001 — best-effort
+            corpus_chars = 0
+        policy = select_policy(
+            corpus_size_chars=corpus_chars, query_shape=shape,
+        )
+        return (
+            policy.bm25_weight,
+            policy.dense_weight,
+            policy.rationale,
+            policy.embedder_hint or "",
+            shape_str,
+        )
+
+    def _compute_retrieval_quality(
+        self, *, top1_cosine: float, confidence_gap: float,
+        no_relevant_results: bool, n_chunks: int,
+    ) -> str:
+        """Coarse confidence summary derived from the dense-cosine
+        signals. See ``SearchResult.retrieval_quality`` docstring for
+        the labels' semantics. Thresholds eyeballed from dogfood data
+        — per-corpus calibration may shift them later."""
+        if no_relevant_results:
+            return "abstain"
+        if n_chunks == 0:
+            return "unknown"
+        if top1_cosine >= 0.75 and confidence_gap >= 0.10:
+            return "high"
+        if top1_cosine >= 0.60:
+            return "medium"
+        if top1_cosine >= 0.50 and confidence_gap >= 0.15:
+            return "medium"
+        return "low"
+
     def _scope_to_embedding_rows(
         self, scope: ScopeDecision
     ) -> Optional[tuple[int, ...]]:
@@ -963,6 +1070,9 @@ class Searcher:
         self,
         bm25_rankings: Sequence[Sequence[Hit]],
         dense_rankings: Sequence[Sequence[Hit]],
+        *,
+        bm25_weight: Optional[float] = None,
+        dense_weight: Optional[float] = None,
     ) -> list[tuple[int, float]]:
         """Combine all per-query rankings into one ``(chunk_id, score)`` list.
 
@@ -973,10 +1083,15 @@ class Searcher:
 
         Output is sorted descending by fused score; ties broken
         deterministically by chunk_id for replay stability.
+
+        ``bm25_weight`` / ``dense_weight`` override the
+        ``SearcherConfig`` defaults for this fusion only — used by the
+        auto-policy router to flip retrieval shape per call without
+        mutating the global config. ``None`` falls back to the config.
         """
         k = self._config.rrf_k
-        bw = self._config.bm25_weight
-        dw = self._config.dense_weight
+        bw = bm25_weight if bm25_weight is not None else self._config.bm25_weight
+        dw = dense_weight if dense_weight is not None else self._config.dense_weight
 
         fused: dict[int, float] = {}
         for ranking in bm25_rankings:
