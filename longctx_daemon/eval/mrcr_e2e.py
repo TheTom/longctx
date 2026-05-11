@@ -78,10 +78,10 @@ BINS_BY_CHAR: dict[str, tuple[int, int]] = {
 }
 
 DATASET_REPO = "openai/mrcr"
-NEEDLE_SHARDS: dict[int, str] = {
-    2: "2needle/2needle_0.parquet",
-    4: "4needle/4needle_0.parquet",
-    8: "8needle/8needle_0.parquet",
+NEEDLE_SHARDS: dict[int, list[str]] = {
+    2: ["2needle/2needle_0.parquet", "2needle/2needle_1.parquet"],
+    4: ["4needle/4needle_0.parquet", "4needle/4needle_1.parquet"],
+    8: ["8needle/8needle_0.parquet", "8needle/8needle_1.parquet"],
 }
 
 DEFAULT_TOP_K = 8
@@ -1169,11 +1169,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             file=sys.stderr,
         )
         if pol.embedder_hint:
-            print(
-                f"[auto-policy] embedder_hint: {pol.embedder_hint} "
-                f"(NOT swapped automatically — set --embedder to apply)",
-                file=sys.stderr,
-            )
+            if args.embedder is None:
+                args.embedder = pol.embedder_hint
+                print(
+                    f"[auto-policy] embedder swapped → {pol.embedder_hint}",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"[auto-policy] embedder_hint: {pol.embedder_hint} "
+                    f"(skipped — explicit --embedder {args.embedder!r} wins)",
+                    file=sys.stderr,
+                )
         if pol.rationale:
             print(f"[auto-policy] rationale: {pol.rationale}",
                   file=sys.stderr)
