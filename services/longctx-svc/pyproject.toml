@@ -47,7 +47,7 @@ longctx-svc = "longctx_svc.cli:main"
 [project.urls]
 Homepage = "https://github.com/TheTom/longctx"
 Repository = "https://github.com/TheTom/longctx"
-Documentation = "https://github.com/TheTom/longctx/blob/main/docs/PRD-v0.3.md"
+Documentation = "https://github.com/TheTom/longctx#readme"
 
 [tool.setuptools.packages.find]
 include = ["longctx_svc*"]

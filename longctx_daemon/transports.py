@@ -1,7 +1,6 @@
 """SSE + streamable-http MCP transports for the longctx daemon — Phase 2.1.
 
-Per PRD-phase2-mcp-daemon §6.1 the daemon must expose all three common
-MCP transports concurrently:
+The daemon exposes all three common MCP transports concurrently:
 
   * stdio              — already shipped in 2.0 via ``MCPServer.run_stdio``
   * sse                — HTTP SSE (older spec, well-supported)

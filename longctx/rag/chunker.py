@@ -1,6 +1,6 @@
 """Token-aware chunker for the 12M coarse-filter pipeline.
 
-Stage 0 of the hierarchical-selector pipeline (see docs/PRD-12m-coarse-filter.md).
+Stage 0 of the hierarchical-selector pipeline.
 
 Splits raw text into ``Chunk`` objects with stable identity. Two modes:
 

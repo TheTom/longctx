@@ -1,6 +1,6 @@
 """Coarse filter — BM25 + dense embedding hybrid with RRF fusion.
 
-Stage 1 of the hierarchical-selector pipeline (see docs/PRD-12m-coarse-filter.md).
+Stage 1 of the hierarchical-selector pipeline.
 
 Trims O(N) candidate chunks down to top-K (default 1000) cheaply, so the
 existing BGE cross-encoder rerank stage stays bounded regardless of input
@@ -166,8 +166,7 @@ class CoarseFilter:
             bm25_weight, dense_weight: optional reweighting if one
                 ranking source consistently outperforms the other.
                 Set one to 0.0 to disable that ranking source entirely
-                (e.g. ``dense_weight=0`` for pure-BM25 mode — the
-                "tier 4.3" lane in docs/embedding-roadmap.md). Default
+                (e.g. ``dense_weight=0`` for pure-BM25 mode). Default
                 is equal-weight RRF.
 
         Returns:

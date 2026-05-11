@@ -61,8 +61,7 @@ always see a bounded top-K regardless of input size.
 - **`longctx.rag.coarse_filter.CoarseFilter`** — BM25 + dense embedding
   hybrid with Reciprocal Rank Fusion (k=60). Default embedder
   `BAAI/bge-small-en-v1.5`. `bm25_weight=0` or `dense_weight=0`
-  selects pure-dense or pure-BM25 mode (tier 4.3 in
-  `docs/embedding-roadmap.md`).
+  selects pure-dense or pure-BM25 mode.
 - **`CoarseFilter.filter_multi_query(chunks, queries)`** — RRF-fuses
   rankings across N paraphrase queries. One BM25 build + one dense
   embed pass; per-query cost is just an argsort. ~150× rank
@@ -90,7 +89,6 @@ always see a bounded top-K regardless of input size.
 - **`longctx.eval.bench_coarse_filter_real`** — real-corpus NIAH
   bench. Walks a directory, plants a needle, runs the pipeline.
   Privacy-preserving: only summary metrics saved.
-- **`docs/PRD-12m-coarse-filter.md`** — spec document.
 - **`benchmark/coarse_filter/RESULTS.md`** — sweep tables + caveats.
 
 ### Numbers (M5 Max / MPS / bge-small / synthetic NIAH)
@@ -218,7 +216,6 @@ Score: 0.440 plain / 0.409 chunked at top-K=8. The figure is below SubQ Inc.'s p
 
 Embed time scales linearly with haystack size (`O(n)`). For short contexts (≤30K chars) the cost is imperceptible. For long contexts (~1M chars on CPU MiniLM-L6 = ~7s) the cost is visible. The cache makes the first-call cost a one-time tax for any pattern that re-queries the same haystack (chat-with-PDF, codebase chat, persistent KBs); GPU autodetect makes the first-call cost ~0.5s on MPS / ~0.2s on CUDA. Together they cover ~95% of real usage patterns.
 
-See `docs/embedding-roadmap.md` for the full roadmap of future tiers (BM25 prefilter, hierarchical chunking, ANE Core ML, ColBERT-style late interaction).
 
 ### Test coverage
 

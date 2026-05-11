@@ -336,7 +336,7 @@ llama.cpp, vllm-swift, the obsidian vault, plus longctx itself —
 | single-query | 1 | 9.5 | 25 | 47 | 177 | 0/20 |
 | multi-query | 1 | **4** | 17 | **41** | 108 | 0/20 |
 
-**longctx-svc latency** (PRD §6 acceptance: <100 ms warm):
+**longctx-svc latency** (target: <100 ms warm):
 - Cold build (20-file project): 12.7 s
 - Warm ``/retrieve`` mean: **63.8 ms** ✅
 - Warm p95: 63.2 ms
@@ -358,30 +358,30 @@ Full curves + receipts in [`docs/results.md`](docs/results.md),
 
 ## Features (v0.3.0–v0.3.3, all in)
 
-| PRD ref | Feature | Status |
-|---|---|:-:|
-| §5.1 | Scope detection from prefill paths (absolute + relative) | ✅ |
-| §5.2 | Hot scope (1K files) → Package scope (50K) | ✅ |
-| §5.3 | Caps + .gitignore + always-skip dirs | ✅ |
-| §5.4 | Line-window chunker | ✅ |
-| §5.4 | Tree-sitter chunker (Python/TS/JS/Go/Rust, opt-in `LONGCTX_TS=1`) | ✅ v0.3.1 |
-| §5.5 | Header-based session isolation (`x-session-affinity` / etc) | ✅ |
-| §5.6 | RW-lock per scope, file watcher (1s debounce, incremental re-embed) | ✅ |
-| §5.7 | LRU + idle eviction (sessions 2h, indexes 30m) | ✅ |
-| §5.8 | Manual scope override (`explicit_scope` body field) | ✅ |
-| §5.9 | Debug headers + `/longctx/status` | ✅ |
-| §5.10 | Local-only privacy stance | ✅ |
-| §6.0 | OpenAI-compat passthrough proxy + sidecar spawn | ✅ |
-| §6.0 | Disk cache `~/.longctx/<scope-hash>/` | ✅ |
-| §6.1 | Auto Hot→Package promotion when out-of-Hot path mentioned | ✅ v0.3.1 |
-| §6.2 | Confidence-driven promotion (top-K cosine across N turns) | ✅ v0.3.2 |
-| §6.3 | Workspace `ws:` mode (multi-scope query merge) | ✅ v0.3.3 |
-| §6.3 | First-class `--enable-longctx` wiring (vllm-swift) | ✅ v0.3.3 |
-| §6.3 | Generic OpenAI proxy mode (vLLM / llama.cpp / any compat) | ✅ v0.3.3 |
-| §6.3 | Native CLI-flag integration for vLLM / llama.cpp | 🛣️ future |
-| — | Symbol-aware retrieval (sym-grep + file-type prior) | ✅ |
-| — | Auto-policy router (context-size + query-shape adaptive) | ✅ |
-| — | Per-corpus relevance floor + ``longctx calibrate`` | ✅ |
+| Feature | Status |
+|---|:-:|
+| Scope detection from prefill paths (absolute + relative) | ✅ |
+| Hot scope (1K files) → Package scope (50K) | ✅ |
+| Caps + .gitignore + always-skip dirs | ✅ |
+| Line-window chunker | ✅ |
+| Tree-sitter chunker (Python/TS/JS/Go/Rust, opt-in `LONGCTX_TS=1`) | ✅ |
+| Header-based session isolation (`x-session-affinity` / etc) | ✅ |
+| RW-lock per scope, file watcher (1s debounce, incremental re-embed) | ✅ |
+| LRU + idle eviction (sessions 2h, indexes 30m) | ✅ |
+| Manual scope override (`explicit_scope` body field) | ✅ |
+| Debug headers + `/longctx/status` | ✅ |
+| Local-only privacy stance | ✅ |
+| OpenAI-compat passthrough proxy + sidecar spawn | ✅ |
+| Disk cache `~/.longctx/<scope-hash>/` | ✅ |
+| Auto Hot→Package promotion when out-of-Hot path mentioned | ✅ |
+| Confidence-driven promotion (top-K cosine across N turns) | ✅ |
+| Workspace `ws:` mode (multi-scope query merge) | ✅ |
+| First-class `--enable-longctx` wiring (vllm-swift) | ✅ |
+| Generic OpenAI proxy mode (vLLM / llama.cpp / any compat) | ✅ |
+| Symbol-aware retrieval (sym-grep + file-type prior) | ✅ |
+| Auto-policy router (context-size + query-shape adaptive) | ✅ |
+| Per-corpus relevance floor + ``longctx calibrate`` | ✅ |
+| Native CLI-flag integration for vLLM / llama.cpp | 🛣️ future |
 
 ---
 
@@ -403,9 +403,6 @@ longctx/
 │   ├── policy.py              # auto-policy router
 │   └── eval/                  # MRCR e2e + Recall@K + NIAH rigs
 ├── docs/
-│   ├── PRD-v0.3.md            # the v0.3 service spec
-│   ├── PRD-phase2-mcp-daemon.md
-│   ├── PRD-12m-coarse-filter.md
 │   ├── v03-quickstart.md
 │   └── results.md
 ├── benchmark/                 # bench outputs (mrcr_e2e, coarse_filter, ...)
@@ -422,7 +419,7 @@ longctx/
 
 ## What's next
 
-Out-of-scope for v0.3 (per PRD §11), tracked separately:
+Out-of-scope for v0.3, tracked separately:
 - **First-class ``--enable-longctx`` integration for upstream vLLM and
   llama.cpp** — pushes scope detection + retrieval into the engine's
   prompt-build path so users get the same one-flag UX as vllm-swift.

@@ -4,9 +4,9 @@ Backed by ``loguru``. Two output sinks:
   * stderr (always — keeps stdio MCP traffic clean on stdout)
   * optional rotating file sink
 
-The single most useful artifact this module emits is the per-MCP-call
-JSON line described in PRD-phase2-mcp-daemon.md §14.4. ``log_mcp_call``
-emits exactly that schema, with the exact key names the spec specifies.
+The single most useful artifact this module emits is a per-MCP-call
+JSON line. ``log_mcp_call`` emits a stable schema with explicit key
+names so log consumers can rely on the shape.
 
 Trace context (trace_id, session_id, connection_id, client name/version)
 is propagated via ``contextvars.ContextVar`` so that any sub-event logged

@@ -1,7 +1,4 @@
-"""longctx-svc — local retrieval companion for inference servers.
-
-See docs/PRD-v0.3.md for the spec.
-"""
+"""longctx-svc — local retrieval companion for inference servers."""
 
 __version__ = "0.3.1"
 

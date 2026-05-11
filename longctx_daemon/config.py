@@ -9,10 +9,9 @@ Owns three things:
   embedder change, port rebind, etc.). The daemon (Agent F) wires the
   diff to SIGHUP; we just produce it.
 
-See ``docs/PRD-phase2-mcp-daemon.md`` §3.2 (config format), §3.7 (live
-add/remove), §3.9 (env precedence), §3.10 (SIGHUP reload), §11.1
-(non-interactive defaults), §12.4.1 (Tier 1 missing-root grace), §14.8.1
-(replay log retention).
+Covers config format, live add/remove, env precedence, SIGHUP reload,
+non-interactive defaults, the Tier-1 missing-root grace path, and
+replay-log retention.
 
 Public surface: ``ServiceConfig`` + section dataclasses, ``load_config``,
 ``write_config``, ``default_config``, ``config_path``, ``reconcile``,
@@ -336,7 +335,7 @@ def config_path() -> Path:
 
 
 def default_config() -> ServiceConfig:
-    """Construct a ``ServiceConfig`` with all PRD-§3.2 defaults.
+    """Construct a ``ServiceConfig`` with all documented defaults.
 
     Useful for ``longctx init --non-interactive`` and as a baseline for
     test fixtures. No I/O — does not touch ``config_path()``.

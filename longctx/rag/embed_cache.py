@@ -12,7 +12,6 @@ For "fresh haystack every query" workloads (one-shot PDF Q&A) the cache is
 a no-op. For "ask many questions of one doc" or "persistent knowledge
 base" patterns it drops embed time to ~0s after the first call.
 
-See docs/embedding-roadmap.md for the broader strategy.
 """
 from __future__ import annotations
 

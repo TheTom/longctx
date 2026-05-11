@@ -9,9 +9,8 @@ Talks to storage via the ``ChunkStore`` + ``EmbedStore`` Protocols only
 ``longctx.rag.chunker.Chunker`` for tokenization-aware splits so the
 daemon and the Phase 1 RAG pipeline produce compatible chunks.
 
-See docs/PRD-phase2-mcp-daemon.md §3 (filter chain), §4 (storage
-schema), and §4.5 (incremental update protocol — content-addressed
-chunk reuse).
+Covers the filter chain, the storage schema, and the incremental
+update protocol (content-addressed chunk reuse).
 """
 from __future__ import annotations
 
@@ -49,8 +48,8 @@ class EmbedderMismatchError(RuntimeError):
 
 # ------------------------------------------------------------ config + result
 
-# Defaults from PRD-phase2-mcp-daemon.md §3.2. Kept as module-level
-# constants so callers can extend rather than redefine.
+# Default exclude/include patterns. Kept as module-level constants
+# so callers can extend rather than redefine.
 DEFAULT_EXCLUDE_PATTERNS: tuple[str, ...] = (
     "**/node_modules", "**/.git/objects", "**/__pycache__",
     "**/.venv", "**/venv", "**/.pytest_cache",
@@ -89,9 +88,8 @@ TEXT_EXTENSIONS: frozenset[str] = frozenset({
 class IndexerConfig:
     """Config for the indexer's filter chain + batching.
 
-    See docs/PRD-phase2-mcp-daemon.md §3.2 for full semantics. This
-    dataclass mirrors the user-facing config keys but in already-parsed
-    form (tuples/frozensets, no Path resolution).
+    Mirrors the user-facing config keys but in already-parsed form
+    (tuples/frozensets, no Path resolution).
     """
     max_file_size_bytes: int = 5 * 1024 * 1024
     include_extensions: tuple[str, ...] = ()

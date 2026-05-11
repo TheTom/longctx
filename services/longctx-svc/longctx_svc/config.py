@@ -118,7 +118,7 @@ class Limits:
     # extra BM25 index build (~50ms/1k chunks) and a per-query rank pass.
     # Worth it on huge scopes where rare-term queries (identifiers, codes,
     # names) lose to cosine alone. Mirrors longctx.rag.coarse_filter
-    # plumbing; see docs/PRD-12m-coarse-filter.md.
+    # plumbing.
     coarse_filter_min_chunks: int = 5000
     rrf_k: int = 60
     # Max tokens to ever splice into a request. 50-line code chunks at

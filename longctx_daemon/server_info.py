@@ -1,6 +1,6 @@
 """Port discovery, ``server.info`` runtime descriptor, and singleton lock.
 
-Implements PRD-phase2-mcp-daemon §8.1–§8.4:
+Three pieces:
   * ``bind_port`` walks forward from a preferred port until a free TCP slot
     is found.
   * ``ServerInfo`` is the dataclass written to

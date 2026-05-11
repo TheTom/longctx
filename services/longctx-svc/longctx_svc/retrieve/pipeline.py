@@ -8,8 +8,7 @@ Multi-query and rerank can each be disabled via config. An optional
 BM25 + dense RRF coarse-filter fusion lane fires when the scope is
 huge (≥`coarse_filter_min_chunks`) and `use_coarse_filter=True` —
 mirrors `longctx.rag.coarse_filter` plumbing for catching rare-term
-queries (identifiers, codes, names) that lose to cosine alone. See
-docs/PRD-12m-coarse-filter.md.
+queries (identifiers, codes, names) that lose to cosine alone.
 
 Symbol-aware augment (2026-05-11): when the caller provides a scope
 root, extract Python identifiers from the query, grep the scope for

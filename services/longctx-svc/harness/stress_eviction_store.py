@@ -1,11 +1,11 @@
-"""Stress test the EvictionStore at 10M-PRD-equivalent chunk counts.
+"""Stress test the EvictionStore at 10M-token-equivalent chunk counts.
 
-PRD assumption: 10M tokens / ~8K turn-tokens / few evicted spans per
-turn = O(few thousand) evicted chunks per session. This test pushes
-to 20K and 50K chunks to confirm brute-force cosine still satisfies
-the retrieve-latency budget (target: < 100 ms per query).
+Working assumption: 10M tokens / ~8K turn-tokens / few evicted spans
+per turn = O(few thousand) evicted chunks per session. This test
+pushes to 20K and 50K chunks to confirm brute-force cosine still
+satisfies the retrieve-latency budget (target: < 100 ms per query).
 
-Decides whether faiss is needed for the 10M PRD or premature opt.
+Decides whether faiss is needed at 10M-token scope or premature opt.
 """
 from __future__ import annotations
 
