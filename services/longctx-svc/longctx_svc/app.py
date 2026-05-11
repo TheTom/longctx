@@ -384,7 +384,14 @@ async def retrieve(req: RetrieveRequest, request: Request,
         return await _retrieve_workspace(req, request, response, sid, state)
 
     explicit_root = Path(req.explicit_scope) if req.explicit_scope else None
-    scope = detect_scope(req.prefill_text, explicit_root=explicit_root)
+    # Pass default_scope so detect_scope can resolve relative path mentions
+    # against the caller's repo root (2026-05-11 fix — Aider and other
+    # cwd-relative agents previously fell through to the last-resort
+    # default_scope branch below, which wedged the scope to the
+    # vllm-swift cwd instead of the actual repo).
+    scope = detect_scope(req.prefill_text,
+                         explicit_root=explicit_root,
+                         default_scope=req.default_scope)
     # UX fallback (no PRD section — testers asked for it 2026-05-07):
     # if path detection found nothing AND a default_scope is provided,
     # treat the default as the scope. Lets tool-using agents (Hermes,
@@ -404,7 +411,8 @@ async def retrieve(req: RetrieveRequest, request: Request,
     # mentions so subsequent `ws:` queries can fan out across them.
     if sid and scope is not None and not explicit_root:
         from longctx_svc.scope.detect import detect_scopes
-        for s in detect_scopes(req.prefill_text):
+        for s in detect_scopes(req.prefill_text,
+                               default_scope=req.default_scope):
             if s.scope_hash != scope.scope_hash:
                 state.sessions.bind(sid, s.scope_hash, "multi-mention")
                 # Build the secondary scope's index synchronously so a
@@ -465,6 +473,7 @@ async def retrieve(req: RetrieveRequest, request: Request,
 
     result = state.pipeline.retrieve(
         query=req.query, index=entry.index, top_k=req.top_k,
+        scope_root=scope.root,
     )
     entry.last_query_at = time.time()
     # PRD §6.1 / v0.3.1: path-based promotion

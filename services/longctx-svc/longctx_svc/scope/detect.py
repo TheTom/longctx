@@ -29,6 +29,17 @@ _PATH_RE = re.compile(
     r"(/(?:Users|home|opt|var|usr|tmp|mnt|workspace|repo|repos|private|root|srv|data)/[^\s'\"`)\]]+)"
 )
 
+# Match plausibly-relative paths with a file extension and at least one
+# directory separator, e.g. "django/core/handlers/exception.py". Must NOT
+# start with '/' (those are absolute, handled above). Used when callers
+# pass a `default_scope` to extract_paths_from_prefill so we can resolve
+# relative mentions against the caller's repo root. Required for agents
+# like Aider that cd into a repo and refer to files relatively.
+_REL_PATH_RE = re.compile(
+    r"(?:^|[\s'\"`(])"
+    r"((?!/)[A-Za-z_][\w.-]*(?:/[\w.-]+)+\.[A-Za-z]\w{0,7})"
+)
+
 
 @dataclass(frozen=True)
 class DetectedScope:
@@ -43,10 +54,28 @@ class DetectedScope:
         return self.root.name
 
 
-def extract_paths_from_prefill(prefill_text: str) -> list[Path]:
-    """Return distinct absolute paths mentioned in prefill text."""
+def extract_paths_from_prefill(prefill_text: str,
+                               default_scope: Path | str | None = None,
+                               ) -> list[Path]:
+    """Return distinct paths mentioned in prefill text.
+
+    Absolute paths (``/Users/...``, ``/home/...``, etc.) are extracted as-is
+    by ``_PATH_RE``.
+
+    When ``default_scope`` is provided, relative paths that look like real
+    file references (``django/core/foo.py``) are ALSO extracted, resolved
+    against ``default_scope``, and included only if the resolved file
+    actually exists. This lets agents that cd into a repo and refer to
+    files relatively (Aider, Cursor agentic, OpenCode in workspace mode,
+    direct MCP callers) still trigger scope routing without forcing every
+    consumer to splice absolute paths into the prompt.
+
+    Existence-check is the safety net against false positives from
+    casual prose containing dotted tokens.
+    """
     seen: set[str] = set()
     paths: list[Path] = []
+    # 1. Absolute paths — same behavior as before.
     for m in _PATH_RE.finditer(prefill_text or ""):
         s = m.group(1).rstrip(".,;:!?")
         if s in seen:
@@ -55,6 +84,24 @@ def extract_paths_from_prefill(prefill_text: str) -> list[Path]:
         # Drop fragments like /usr/bin/python which aren't user-project roots.
         # We keep them now and filter at sentinel-walk time.
         paths.append(Path(s))
+    # 2. Relative paths resolved against default_scope.
+    if default_scope is not None:
+        root = Path(default_scope)
+        try:
+            root = root.expanduser().resolve()
+        except OSError:
+            root = Path(default_scope)
+        for m in _REL_PATH_RE.finditer(prefill_text or ""):
+            s = m.group(1).rstrip(".,;:!?")
+            if s in seen:
+                continue
+            seen.add(s)
+            full = root / s
+            try:
+                if full.exists():
+                    paths.append(full)
+            except OSError:
+                pass
     return paths
 
 
@@ -126,12 +173,19 @@ def _shared_subpath(paths: list[Path]) -> Path | None:
 
 def detect_scopes(prefill_text: str,
                   sentinels: list[str] | None = None,
+                  default_scope: Path | str | None = None,
                   ) -> list[DetectedScope]:
     """PRD §6.3 / v0.3.3: detect ALL distinct sentinel roots referenced
     in the prefill, not just the most common one. Used for multi-scope
     routing in a single conversation.
+
+    ``default_scope`` enables relative-path resolution — paths that don't
+    start with ``/`` are joined to it and kept iff the resolved file
+    exists. Required for agents that cd into a repo and use relative
+    paths in their prompts.
     """
-    paths = extract_paths_from_prefill(prefill_text or "")
+    paths = extract_paths_from_prefill(prefill_text or "",
+                                       default_scope=default_scope)
     if not paths:
         return []
     seen: dict[Path, tuple[Path, str, list[Path]]] = {}
@@ -158,6 +212,7 @@ def detect_scopes(prefill_text: str,
 def detect_scope(prefill_text: str,
                  explicit_root: Path | None = None,
                  sentinels: list[str] | None = None,
+                 default_scope: Path | str | None = None,
                  ) -> DetectedScope | None:
     """Top-level scope detection.
 
@@ -165,7 +220,8 @@ def detect_scope(prefill_text: str,
     skipping prefill-parsing.
 
     Otherwise:
-      - Parse paths
+      - Parse paths (absolute always; relative paths resolved against
+        ``default_scope`` when one is provided, and kept iff they exist)
       - For each, find sentinel root
       - If multiple paths map to the same root and they have a deeper shared
         sub-directory that ALSO has a sentinel, prefer that (monorepo
@@ -182,7 +238,8 @@ def detect_scope(prefill_text: str,
             mentioned_paths=(canon,),
         )
 
-    paths = extract_paths_from_prefill(prefill_text or "")
+    paths = extract_paths_from_prefill(prefill_text or "",
+                                       default_scope=default_scope)
     if not paths:
         return None
 
