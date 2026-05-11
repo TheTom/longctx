@@ -269,15 +269,23 @@ def test_healthz(client):
 
 # --- UX fallback: default_scope when no path detected ---
 
-def test_default_scope_fires_when_no_path_in_message(client, project_dir):
-    """Tool-using agents (Hermes etc.) often don't put absolute paths
-    in user messages. With `default_scope` set, retrieval still fires
-    against the engine's working directory."""
+def test_default_scope_alone_does_not_pin_scope(client, project_dir):
+    """2026-05-11 contract change: ``default_scope`` is for relative-path
+    resolution, NOT a scope-of-last-resort. When no paths appear in the
+    prefill, retrieval returns no-scope rather than silently binding to
+    the engine's cwd. Indexing the wrong dir was actively harmful — the
+    engine-cwd auto-bind was what caused vllm-swift to index its own
+    source 463 chunks deep when Hermes was building in /tmp/foo.
+
+    Auto-engagement now comes from the path-cluster tracker (covered in
+    test_path_cluster_routes.py) — accumulate enough mentions across
+    turns and a scope activates on its own. One turn with zero path
+    mentions correctly produces no scope."""
     response = client.post(
         "/retrieve",
-        headers={"x-session-affinity": "default-scope-test"},
+        headers={"x-session-affinity": "default-scope-alone"},
         json={
-            "prefill_text": "what does the app do?",  # no abs path
+            "prefill_text": "what does the app do?",   # zero abs paths
             "query": "what does the app do",
             "top_k": 4,
             "default_scope": str(project_dir),
@@ -285,9 +293,9 @@ def test_default_scope_fires_when_no_path_in_message(client, project_dir):
     )
     assert response.status_code == 200
     data = response.json()
-    assert data["scope_status"] == "ready"
-    assert data["scope_path"] is not None
-    assert len(data["chunks"]) > 0
+    assert data["scope_status"] == "no-scope"
+    assert data["scope_path"] is None
+    assert data["chunks"] == []
 
 
 def test_path_in_message_overrides_default_scope(client, project_dir, tmp_path):

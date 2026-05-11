@@ -505,21 +505,74 @@ async def retrieve(req: RetrieveRequest, request: Request,
     scope = detect_scope(req.prefill_text,
                          explicit_root=explicit_root,
                          default_scope=req.default_scope)
-    # UX fallback (no PRD section — testers asked for it 2026-05-07):
-    # if path detection found nothing AND a default_scope is provided,
-    # treat the default as the scope. Lets tool-using agents (Hermes,
-    # OpenCode agentic mode) get retrieval without forcing the user to
-    # paste absolute paths in every message.
-    if scope is None and req.default_scope:
-        scope = detect_scope(
-            "", explicit_root=Path(req.default_scope),
+
+    # 2026-05-11: path-cluster scope detection. Two purposes — feed the
+    # session's path tracker (history for future drift / re-activation
+    # decisions) AND, when sentinel-walk turned up nothing, propose the
+    # cluster ancestor as the working scope. Sentinel-found scopes still
+    # win when they exist; cluster is the graceful fallback that handles
+    # fresh dirs (no .git yet), monorepo subdirs, and scratch projects.
+    #
+    # Critical: we DO NOT fall back to req.default_scope as a scope-of-
+    # last-resort. That branch was actively harmful — when the engine's
+    # cwd was unrelated to the working dir (e.g., vllm-swift launched
+    # from its own checkout but the agent was building in /tmp/foo), the
+    # engine cwd got indexed and 8 wrong-scope chunks spliced into every
+    # turn. Better to inject nothing than to poison.
+    MIN_CLUSTER_SCOPE_DEPTH = 3   # rejects "/", "/Users", etc.
+    if sid is not None and not explicit_root:
+        from longctx_svc.scope.detect import (
+            DetectedScope as _DetectedScope,
+            canonicalize_scope,
+            extract_paths_from_prefill,
+            find_sentinel_root,
+            hash_scope,
         )
-        if scope is not None:
-            scope = type(scope)(
-                root=scope.root, sentinel="default-scope",
-                scope_hash=scope.scope_hash,
-                mentioned_paths=scope.mentioned_paths,
+        paths = extract_paths_from_prefill(
+            req.prefill_text or "", default_scope=req.default_scope,
+        )
+        tracker = state.cluster_tracker_for(sid)
+        tick = tracker.observe(paths)
+        if scope is None and tick.active is not None \
+                and len(tick.active.ancestor.parts) >= MIN_CLUSTER_SCOPE_DEPTH:
+            # If the cluster ancestor has a sentinel up the walk, prefer
+            # the sentinel root. Keeps cluster + sentinel paths converging
+            # on the same scope_hash so we don't fragment the index across
+            # /repo (sentinel) vs /repo/src (cluster deepest).
+            anc = tick.active.ancestor
+            sent_hit = find_sentinel_root(anc)
+            if sent_hit is not None \
+                    and len(sent_hit[0].parts) >= MIN_CLUSTER_SCOPE_DEPTH:
+                canon = canonicalize_scope(sent_hit[0])
+                sent_name = sent_hit[1]
+            else:
+                canon = canonicalize_scope(anc)
+                sent_name = "cluster"
+            scope = _DetectedScope(
+                root=canon,
+                sentinel=sent_name,
+                scope_hash=hash_scope(canon),
+                mentioned_paths=tuple(paths),
             )
+        elif scope is None:
+            # No active cluster yet — speculatively warm any candidates
+            # that cleared the cluster threshold but didn't promote. Best-
+            # effort, async, capped at top-2 to bound walk cost.
+            try:
+                for cand in (tick.speculative or [])[:2]:
+                    if len(cand.ancestor.parts) < MIN_CLUSTER_SCOPE_DEPTH:
+                        continue
+                    canon = canonicalize_scope(cand.ancestor)
+                    spec_scope = _DetectedScope(
+                        root=canon, sentinel="cluster-speculative",
+                        scope_hash=hash_scope(canon),
+                        mentioned_paths=tuple(paths),
+                    )
+                    _ensure_scope(state, spec_scope, async_kickoff=True)
+            except Exception:  # noqa: BLE001
+                # Speculative warm is opportunistic — never fail the
+                # request because we couldn't pre-warm an index.
+                pass
     # PRD §6.3 / v0.3.3 — bind every additional sentinel root the prefill
     # mentions so subsequent `ws:` queries can fan out across them.
     if sid and scope is not None and not explicit_root:

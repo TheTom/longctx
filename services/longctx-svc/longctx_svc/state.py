@@ -17,6 +17,7 @@ from pathlib import Path
 from longctx_svc.config import get_config
 from longctx_svc.indexer.builder import ScopeIndex
 from longctx_svc.retrieve.pipeline import RetrievePipeline
+from longctx_svc.scope.tracker import ScopeClusterTracker
 from longctx_svc.session.manager import SessionManager
 
 
@@ -50,6 +51,24 @@ class _State:
         self._scopes: OrderedDict[str, ScopeEntry] = OrderedDict()
         self.sessions = SessionManager()
         self._pipeline: RetrievePipeline | None = None
+        # Path-cluster scope trackers, keyed by session_id. Each session
+        # gets its own tracker so cumulative path observations don't bleed
+        # across unrelated conversations.
+        self._cluster_lock = threading.RLock()
+        self._cluster_trackers: dict[str, ScopeClusterTracker] = {}
+
+    def cluster_tracker_for(self, session_id: str) -> ScopeClusterTracker:
+        """Return (creating if needed) the per-session path-cluster tracker."""
+        with self._cluster_lock:
+            tracker = self._cluster_trackers.get(session_id)
+            if tracker is None:
+                tracker = ScopeClusterTracker()
+                self._cluster_trackers[session_id] = tracker
+            return tracker
+
+    def evict_session_tracker(self, session_id: str) -> None:
+        with self._cluster_lock:
+            self._cluster_trackers.pop(session_id, None)
 
     @property
     def pipeline(self) -> RetrievePipeline:
