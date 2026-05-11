@@ -122,6 +122,15 @@ class _State:
         """LRU evict in-memory indexes (NOT scope entries) past the cap.
         Drops index payloads but keeps the entry shell so re-loads can
         rehydrate later (from disk, once disk persistence lands).
+
+        2026-05-11: explicitly null out `index.embeddings` + `index.chunks`
+        and force gc.collect() after each eviction round. Previously the
+        `entry.index = None` step alone left a non-trivial RSS overhead per
+        evicted scope (~400 MB/scope on the bge-m3 + Python corpus run),
+        because numpy ndarrays + chunk lists hung on through Python's
+        delayed cyclic-collection. Verified by repro on 2026-05-11: 5 new
+        scopes drove longctx-svc RSS 68 MB → 2289 MB with no drop after
+        the 5th scope evicted the 1st.
         """
         cfg = get_config()
         cap = cfg.limits.max_indexes_in_memory
@@ -131,6 +140,7 @@ class _State:
         if len(loaded) <= cap:
             return
         excess = len(loaded) - cap
+        evicted_any = False
         # Evict from the LEFT (oldest) of the OrderedDict.
         for h in list(self._scopes.keys()):
             if excess <= 0:
@@ -144,9 +154,25 @@ class _State:
                     except Exception:  # noqa: BLE001
                         pass
                     entry.watcher = None
+                # Explicit drop of the big arrays before nulling the index
+                # ref. Numpy frees the buffer the moment its refcount hits
+                # zero, but we want to make absolutely sure no transitive
+                # ref (e.g. cached slice via Chunk) keeps the ndarray live.
+                entry.index.embeddings = None
+                entry.index.chunks = []
                 entry.index = None
                 entry.status = "evicted"
                 excess -= 1
+                evicted_any = True
+        if evicted_any:
+            # Force a cyclic-GC pass. ndarrays themselves are refcounted, but
+            # the ScopeIndex ↔ Chunk ↔ inner-dict graph commonly has cycles
+            # from chunker bookkeeping that would otherwise wait for the
+            # next generation-2 sweep to collect. On macOS, where the
+            # malloc arenas already don't aggressively return pages, this
+            # delay shows up as a multi-GB RSS plateau.
+            import gc
+            gc.collect()
 
     def all_scopes(self) -> list[ScopeEntry]:
         with self._registry_lock:
