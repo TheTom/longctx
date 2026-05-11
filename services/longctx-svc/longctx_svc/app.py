@@ -246,8 +246,21 @@ async def evict_write(req: EvictWriteRequest) -> EvictWriteResponse:
 async def evict_retrieve(req: EvictRetrieveRequest) -> EvictRetrieveResponse:
     """vLLM prefill hook calls this on each new turn. Returns top-K
     evicted chunks for the session, ranked by cosine similarity to the
-    current query. Strictly session-isolated."""
+    current query. Strictly session-isolated.
+
+    Auto-resumes from cold storage if the session was hibernated since
+    last access. Resume is transparent to the caller — same response
+    shape, same isolation guarantees, just an extra disk read.
+    """
     store = get_eviction_store()
+    # Tier 4: auto-resume if hibernated. No-op when the session is
+    # already in RAM or has no snapshot.
+    try:
+        store.maybe_resume(req.session_id)
+    except Exception:  # noqa: BLE001
+        # Snapshot fingerprint mismatch / schema mismatch / disk error
+        # — fall through to empty retrieve rather than 500-ing.
+        pass
     chunks = store.retrieve(
         req.session_id, req.query, top_k=req.top_k,
         score_floor=req.score_floor,
@@ -289,6 +302,106 @@ async def evict_dump(session_id: str) -> EvictDumpResponse:
     return EvictDumpResponse(
         session_id=session_id, session_total=len(ranges),
         token_ranges=ranges, layers=layers, scores=scores,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tier 4 — session hibernation (cold storage). Explicit endpoints so clients
+# can hibernate/resume on their own lifecycle. The janitor auto-hibernates
+# on idle; /evict/retrieve auto-resumes from snapshot.
+# ---------------------------------------------------------------------------
+
+
+class HibernateResponse(BaseModel):
+    session_id: str
+    hibernated: bool
+    n_chunks: int
+
+
+class ResumeResponse(BaseModel):
+    session_id: str
+    resumed: bool
+    n_chunks: int
+    error: str | None = None
+
+
+class HibernationStatusResponse(BaseModel):
+    session_id: str
+    in_ram: bool
+    on_disk: bool
+    n_chunks_in_ram: int
+    n_chunks_on_disk: int
+    embedder_fingerprint: str | None
+    hibernated_at: float | None
+
+
+@app.post(
+    "/sessions/{session_id}/hibernate", response_model=HibernateResponse,
+)
+async def session_hibernate(session_id: str) -> HibernateResponse:
+    """Explicitly hibernate a session — serialise its evict-store to
+    disk + drop from RAM. Returns ``hibernated=False`` when the session
+    has no chunks worth persisting (no-op success)."""
+    store = get_eviction_store()
+    # Read chunk count BEFORE hibernate (it'll be dropped after).
+    with store._lock:  # noqa: SLF001
+        idx = store._sessions.get(session_id)  # noqa: SLF001
+        n_chunks = len(idx.chunks) if idx is not None else 0
+    ok = store.hibernate(session_id)
+    return HibernateResponse(
+        session_id=session_id, hibernated=ok, n_chunks=n_chunks,
+    )
+
+
+@app.post(
+    "/sessions/{session_id}/resume", response_model=ResumeResponse,
+)
+async def session_resume(session_id: str) -> ResumeResponse:
+    """Explicitly resume a hibernated session into RAM."""
+    store = get_eviction_store()
+    try:
+        n = store.resume(session_id)
+        return ResumeResponse(
+            session_id=session_id, resumed=n > 0, n_chunks=n,
+        )
+    except Exception as e:  # noqa: BLE001
+        return ResumeResponse(
+            session_id=session_id, resumed=False, n_chunks=0,
+            error=f"{type(e).__name__}: {e}",
+        )
+
+
+@app.get(
+    "/sessions/{session_id}/hibernation-status",
+    response_model=HibernationStatusResponse,
+)
+async def session_hibernation_status(
+    session_id: str,
+) -> HibernationStatusResponse:
+    """Inspect the session's storage tiers. Used by operators + tests."""
+    store = get_eviction_store()
+    with store._lock:  # noqa: SLF001
+        idx = store._sessions.get(session_id)  # noqa: SLF001
+        in_ram = idx is not None
+        n_chunks_in_ram = len(idx.chunks) if idx is not None else 0
+    on_disk = store.is_hibernated(session_id)
+    n_chunks_on_disk = 0
+    fingerprint: str | None = None
+    hibernated_at: float | None = None
+    if on_disk:
+        try:
+            import json as _json
+            with (store._session_dir(session_id) / "metadata.json").open() as f:  # noqa: SLF001
+                meta = _json.load(f)
+            n_chunks_on_disk = int(meta.get("n_chunks", 0))
+            fingerprint = meta.get("embedder_fingerprint")
+            hibernated_at = float(meta.get("hibernated_at", 0.0)) or None
+        except Exception:  # noqa: BLE001
+            pass
+    return HibernationStatusResponse(
+        session_id=session_id, in_ram=in_ram, on_disk=on_disk,
+        n_chunks_in_ram=n_chunks_in_ram, n_chunks_on_disk=n_chunks_on_disk,
+        embedder_fingerprint=fingerprint, hibernated_at=hibernated_at,
     )
 
 
