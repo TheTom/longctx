@@ -140,12 +140,25 @@ _INDEX_STATUS_DOC = (
 _SEARCH_CODEBASE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "query": {"type": "string"},
+        # Phase 2.0.1: query accepts string OR array. When array, each
+        # element runs independently and the response shape becomes
+        # {"groups": [{"query": ..., "chunks": [...]}, ...]} so the
+        # caller knows which chunks came from which sub-question.
+        "query": {
+            "oneOf": [
+                {"type": "string"},
+                {"type": "array", "items": {"type": "string"}, "minItems": 1},
+            ],
+        },
         "cwd": {"type": ["string", "null"]},
         "project": {"type": ["string", "null"]},
         "max_tokens": {"type": "integer", "default": 4096},
         "max_results": {"type": ["integer", "null"]},
         "wait_for_quiescence_ms": {"type": ["integer", "null"]},
+        # Phase 2.0.1: per-call override of the dense-cosine
+        # relevance floor. Top-1 cosine below this returns empty
+        # chunks + no_relevant_results=True. 0 disables.
+        "relevance_floor": {"type": ["number", "null"]},
     },
     "required": ["query"],
     "additionalProperties": False,
@@ -550,13 +563,23 @@ class MCPServer:
     async def _handle_search_codebase(
         self, args: dict[str, Any]
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
-        """Implements PRD §6.2 search_codebase + §6.3 response invariants."""
+        """Implements PRD §6.2 search_codebase + §6.3 response invariants.
+
+        Phase 2.0.1: ``query`` accepts ``str | list[str]``. When a list
+        is passed, each sub-query runs through the full pipeline
+        independently and the response shape becomes
+        ``{"groups": [<per-query SearchResult dict>, ...]}`` instead
+        of a flat top-level chunks list. No merging or de-duplication
+        across groups — the caller needs to know which chunks came from
+        which sub-question.
+        """
         query = args["query"]
         cwd = args.get("cwd")
         project = args.get("project")
         max_tokens = args.get("max_tokens", 4096)
         max_results = args.get("max_results")
         wait_ms = args.get("wait_for_quiescence_ms")
+        relevance_floor = args.get("relevance_floor")
 
         # Sticky session: when caller didn't pass project= or cwd, use
         # the session's set_active_project value (PRD §3.4 / §3.9). The
@@ -564,10 +587,18 @@ class MCPServer:
         # the actual routing — we just thread the value through.
         sticky = self._session_state().active_project_sticky
 
-        # The searcher may be sync or async; await accordingly. We pass
-        # ``active_project_sticky`` only when the searcher's signature
-        # accepts it — duck-type-friendly for the FakeSearcher tests
-        # already in tests/daemon/test_mcp_server.py.
+        # ---------- multi-question dispatch ----------
+        if isinstance(query, list):
+            return await self._handle_search_codebase_multi(
+                queries=tuple(query),
+                cwd=cwd, project=project,
+                max_tokens=max_tokens, max_results=max_results,
+                wait_ms=wait_ms,
+                relevance_floor=relevance_floor,
+                sticky=sticky,
+            )
+
+        # ---------- single-string path (Phase 2.0 contract) ----------
         kwargs: dict[str, Any] = {
             "query": query,
             "cwd": cwd,
@@ -578,11 +609,14 @@ class MCPServer:
         }
         if sticky is not None:
             kwargs["active_project_sticky"] = sticky
+        if relevance_floor is not None:
+            kwargs["relevance_floor"] = relevance_floor
         try:
             result = self.searcher.search(**kwargs)
         except TypeError:
-            # Older fakes don't take active_project_sticky — drop it.
+            # Older fakes don't take new kwargs — drop them progressively.
             kwargs.pop("active_project_sticky", None)
+            kwargs.pop("relevance_floor", None)
             result = self.searcher.search(**kwargs)
         if asyncio.iscoroutine(result):
             result = await result
@@ -617,6 +651,17 @@ class MCPServer:
             "pending_updates": result.freshness.pending_updates,
             "indexed_through": result.freshness.indexed_through,
             "scope_decision": _dataclass_to_flat_dict(result.scope_decision),
+            # Phase 2.0.1 honest-retrieval signals:
+            "no_relevant_results": getattr(
+                result, "no_relevant_results", False,
+            ),
+            "top1_dense_cosine": getattr(
+                result, "top1_dense_cosine", 0.0,
+            ),
+            "query_type": getattr(
+                result, "query_type", "natural_language",
+            ),
+            "confidence_gap": getattr(result, "confidence_gap", 0.0),
         }
 
         scope_dict = response["scope_decision"]
@@ -628,6 +673,164 @@ class MCPServer:
             "files": [
                 f"{c['file_path']}:{c['start_line']}-{c['end_line']}"
                 for c in kept_chunks
+            ],
+            "is_fully_fresh": response["is_fully_fresh"],
+            "pending_updates": response["pending_updates"],
+            "indexed_through": response["indexed_through"],
+            "no_relevant_results": response["no_relevant_results"],
+            "top1_dense_cosine": response["top1_dense_cosine"],
+            "query_type": response["query_type"],
+        }
+        return response, scope_dict, latency_dict, summary
+
+    async def _handle_search_codebase_multi(
+        self,
+        *,
+        queries: tuple[str, ...],
+        cwd: Optional[str],
+        project: Optional[str],
+        max_tokens: int,
+        max_results: Optional[int],
+        wait_ms: Optional[int],
+        relevance_floor: Optional[float],
+        sticky: Optional[str],
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+        """Phase 2.0.1 multi-question path.
+
+        Each sub-query runs through ``searcher.search`` independently;
+        results are returned as ``groups: [<per-query SearchResult>]``
+        with NO merging or de-duplication — the caller needs to know
+        which chunk answered which sub-question.
+
+        Falls back to ``searcher.search_multi`` when the searcher
+        exposes it (Phase 2.0.1+); otherwise loops manually so older
+        ``FakeSearcher`` test fixtures keep working.
+        """
+        # Try the rich search_multi entry point first.
+        kwargs: dict[str, Any] = {
+            "queries": queries,
+            "cwd": cwd,
+            "project": project,
+            "max_tokens": max_tokens,
+            "max_results": max_results,
+            "wait_for_quiescence_ms": wait_ms,
+        }
+        if sticky is not None:
+            kwargs["active_project_sticky"] = sticky
+        if relevance_floor is not None:
+            kwargs["relevance_floor"] = relevance_floor
+
+        multi: Optional[Any] = None
+        if hasattr(self.searcher, "search_multi"):
+            try:
+                multi = self.searcher.search_multi(**kwargs)
+            except TypeError:
+                kwargs.pop("relevance_floor", None)
+                kwargs.pop("active_project_sticky", None)
+                try:
+                    multi = self.searcher.search_multi(**kwargs)
+                except TypeError:
+                    multi = None
+            if asyncio.iscoroutine(multi):
+                multi = await multi
+
+        if multi is None:
+            # Fallback: loop ``search`` per sub-query.
+            groups: list[SearchResult] = []
+            for q in queries:
+                kw: dict[str, Any] = {
+                    "query": q,
+                    "cwd": cwd,
+                    "project": project,
+                    "max_tokens": max_tokens,
+                    "max_results": max_results,
+                    "wait_for_quiescence_ms": wait_ms,
+                }
+                if sticky is not None:
+                    kw["active_project_sticky"] = sticky
+                if relevance_floor is not None:
+                    kw["relevance_floor"] = relevance_floor
+                try:
+                    r = self.searcher.search(**kw)
+                except TypeError:
+                    kw.pop("active_project_sticky", None)
+                    kw.pop("relevance_floor", None)
+                    r = self.searcher.search(**kw)
+                if asyncio.iscoroutine(r):
+                    r = await r
+                groups.append(r)
+        else:
+            groups = list(multi.groups)
+
+        # Build a per-group response dict by reusing _search_chunk_to_dict
+        # logic. We keep the response shape symmetric with the single-
+        # query path — each group has the same fields the agent would
+        # see for a standalone search_codebase call.
+        group_dicts: list[dict[str, Any]] = []
+        for q, g in zip(queries, groups):
+            chunks_d = [_search_chunk_to_dict(sc) for sc in g.chunks]
+            group_dicts.append({
+                "query": q,
+                "chunks": chunks_d,
+                "no_relevant_results": getattr(
+                    g, "no_relevant_results", False,
+                ),
+                "top1_dense_cosine": getattr(
+                    g, "top1_dense_cosine", 0.0,
+                ),
+                "query_type": getattr(g, "query_type", "natural_language"),
+                "confidence_gap": getattr(g, "confidence_gap", 0.0),
+            })
+
+        # Shared fields: take the first group's scope; worst-case
+        # freshness across groups; sum latencies.
+        first = groups[0] if groups else None
+        if first is not None:
+            scope_dict = _dataclass_to_flat_dict(first.scope_decision)
+        else:
+            scope_dict = {}
+
+        any_stale = any(
+            (not g.freshness.is_fully_fresh) for g in groups
+        )
+        max_pending = max(
+            (g.freshness.pending_updates for g in groups), default=0,
+        )
+        oldest_indexed = min(
+            (g.freshness.indexed_through for g in groups),
+            default=_now_iso(),
+        )
+        stale_union: set[str] = set()
+        for g in groups:
+            stale_union.update(g.freshness.stale_files)
+
+        response: dict[str, Any] = {
+            "groups": group_dicts,
+            "is_fully_fresh": (not any_stale and max_pending == 0),
+            "pending_updates": max_pending,
+            "indexed_through": oldest_indexed,
+            "stale_files": sorted(stale_union),
+            "scope_decision": scope_dict,
+        }
+
+        latency_dict = {
+            "wait_quiescence": sum(
+                g.latency_ms.wait_quiescence for g in groups
+            ),
+            "embed_query": sum(g.latency_ms.embed_query for g in groups),
+            "bm25_score": sum(g.latency_ms.bm25_score for g in groups),
+            "dense_score": sum(g.latency_ms.dense_score for g in groups),
+            "rrf_fuse": sum(g.latency_ms.rrf_fuse for g in groups),
+            "fetch_chunks": sum(g.latency_ms.fetch_chunks for g in groups),
+            "total": sum(g.latency_ms.total for g in groups),
+        }
+
+        summary = {
+            "n_groups": len(group_dicts),
+            "queries": list(queries),
+            "chunk_counts": [len(g["chunks"]) for g in group_dicts],
+            "no_relevant_results": [
+                g["no_relevant_results"] for g in group_dicts
             ],
             "is_fully_fresh": response["is_fully_fresh"],
             "pending_updates": response["pending_updates"],
@@ -1160,8 +1363,15 @@ class MCPServer:
 
 # ----------------------------------------------------------- shape helpers
 def _search_chunk_to_dict(sc) -> dict[str, Any]:
-    """SearchChunk → flat dict matching §6.3."""
-    return {
+    """SearchChunk → flat dict matching §6.3.
+
+    Includes ``dense_cosine`` (Phase 2.0.1) — the per-chunk pre-fusion
+    semantic match anchor — so the agent can act per-chunk on
+    confidence rather than only on the response-level top-1 number.
+    Tolerates older SearchChunk instances (test fakes) that don't have
+    the field via getattr fallback.
+    """
+    out = {
         "project": sc.citation.project,
         "file_path": sc.citation.file_path,
         "start_line": sc.citation.start_line,
@@ -1169,6 +1379,10 @@ def _search_chunk_to_dict(sc) -> dict[str, Any]:
         "text": sc.text,
         "relevance_score": sc.relevance_score,
     }
+    cos = getattr(sc, "dense_cosine", None)
+    if cos is not None:
+        out["dense_cosine"] = float(cos)
+    return out
 
 
 def _dataclass_to_flat_dict(obj: Any) -> dict[str, Any]:

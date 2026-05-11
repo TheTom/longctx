@@ -114,7 +114,7 @@ def stack(tmp_path: Path):
     )
     searcher = Searcher(
         chunk_store=chunk_store, embed_store=embed_store,
-        embedder=embedder, config=SearcherConfig(),
+        embedder=embedder, config=SearcherConfig(relevance_floor=0.0),
     )
     yield {
         "chunk_store": chunk_store, "embed_store": embed_store,

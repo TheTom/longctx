@@ -393,6 +393,139 @@ def _mcpserver_accepts_embed_store() -> bool:
         return False
 
 
+# --------------------------------------------------------- calibrate command
+
+def _cmd_calibrate(args: argparse.Namespace) -> int:
+    """Run a per-corpus relevance-floor sweep and print the table.
+
+    Sweeps a range of dense-cosine thresholds against the abstention
+    suite (30 off-corpus + 12 in-corpus queries) and prints the
+    suppression / FNR trade-off plus the recommended floor (highest
+    floor whose FNR is at most ``--max-fnr``, default 0.05).
+
+    Default behavior is observation-only: print the table + exit. To
+    also persist the recommendation to the user's config, pass
+    ``--write-config`` — that path explicitly opts in and rewrites
+    ``[index].relevance_floor``.
+    """
+    from longctx_daemon.eval.abstention import (
+        render_sweep_table,
+        sweep_floor,
+    )
+
+    corpus = Path(args.corpus_dir).expanduser().resolve()
+    if not corpus.is_dir():
+        print(
+            f"error: --corpus-dir not a directory: {corpus}",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Build the floor list. We construct the sequence once here so the
+    # CLI surface stays simple (min/max/step) while ``sweep_floor``
+    # accepts any sequence.
+    floors: list[float] = []
+    f = args.floor_min
+    while f <= args.floor_max + 1e-9:
+        floors.append(round(f, 6))
+        f += args.floor_step
+
+    if args.verbose:
+        print(
+            f"[longctx calibrate] sweeping {len(floors)} floors "
+            f"({floors[0]:.2f}..{floors[-1]:.2f}) on {corpus}",
+            file=sys.stderr,
+        )
+
+    report = sweep_floor(
+        corpus,
+        floors=floors,
+        embedder_id=args.embedder,
+        device=args.device,
+        max_fnr=args.max_fnr,
+    )
+
+    if args.json:
+        print(json.dumps({
+            "corpus_dir": str(corpus),
+            "points": report.points,
+            "recommended_floor": report.recommended_floor,
+            "max_fnr": report.max_fnr,
+        }, indent=2))
+    else:
+        print(render_sweep_table(report))
+        print(
+            f"recommended floor: {report.recommended_floor:.2f} "
+            f"(highest floor with FNR ≤ {report.max_fnr:.0%})"
+        )
+
+    if args.write_config:
+        return _persist_floor_to_config(
+            report.recommended_floor,
+            config_path_override=(
+                Path(args.config).expanduser() if args.config else None
+            ),
+            verbose=args.verbose,
+        )
+    return 0
+
+
+def _persist_floor_to_config(
+    floor: float,
+    *,
+    config_path_override: Optional[Path],
+    verbose: bool,
+) -> int:
+    """Update ``[index].relevance_floor`` in the user's config file.
+
+    Loads the existing config (or default if missing), bumps the
+    field, validates, and writes back. Idempotent — running twice with
+    the same ``floor`` produces the same on-disk content. Returns the
+    standard exit code (0 ok, 2 invalid, 3 IO error).
+    """
+    from dataclasses import replace
+
+    from longctx_daemon.config import (
+        ConfigError,
+        ServiceConfig,
+        config_path as _default_config_path,
+        default_config,
+        load_config,
+        write_config,
+    )
+
+    cfg_path = config_path_override or _default_config_path()
+    try:
+        if cfg_path.exists():
+            cfg = load_config(cfg_path)
+        else:
+            cfg = default_config()
+    except ConfigError as exc:
+        print(f"error: failed to read config: {exc}", file=sys.stderr)
+        return 2
+
+    new_index = replace(cfg.index, relevance_floor=float(floor))
+    new_cfg = ServiceConfig(
+        corpus=cfg.corpus, server=cfg.server, index=new_index,
+        watcher=cfg.watcher, cleanup=cfg.cleanup, search=cfg.search,
+        logging=cfg.logging,
+    )
+    try:
+        write_config(cfg_path, new_cfg)
+    except OSError as exc:
+        print(f"error: failed to write config: {exc}", file=sys.stderr)
+        return 3
+
+    print(f"updated {cfg_path}: [index].relevance_floor = {floor:.2f}")
+    if verbose:
+        print(
+            "  reload the daemon (`longctx reload`) to pick up the new "
+            "floor.",
+            file=sys.stderr,
+        )
+    return 0
+
+
 # ------------------------------------------------------------ version command
 
 def _cmd_version(args: argparse.Namespace) -> int:
@@ -1156,6 +1289,48 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve.set_defaults(func=_cmd_serve)
 
+    # --- calibrate (Phase 2.0.1+)
+    cal = sub.add_parser(
+        "calibrate",
+        help="Sweep relevance-floor thresholds on a real corpus + recommend.",
+        description=(
+            "Index a corpus and run the abstention suite (30 off-corpus + "
+            "12 in-corpus queries) at a range of dense-cosine thresholds. "
+            "Print suppression rate / false-negative rate per floor + the "
+            "recommended floor (highest floor with FNR ≤ --max-fnr). "
+            "Default behavior is observation-only — pass --write-config to "
+            "persist the recommendation to the user's config file."
+        ),
+    )
+    cal.add_argument(
+        "--corpus-dir", required=True,
+        help="Directory to index + evaluate.",
+    )
+    cal.add_argument("--floor-min", type=float, default=0.30)
+    cal.add_argument("--floor-max", type=float, default=0.70)
+    cal.add_argument("--floor-step", type=float, default=0.05)
+    cal.add_argument(
+        "--max-fnr", type=float, default=0.05,
+        help="Max acceptable false-negative rate when picking the "
+             "recommended floor (default 0.05).",
+    )
+    cal.add_argument("--embedder", default="BAAI/bge-small-en-v1.5")
+    cal.add_argument("--device", default="auto")
+    cal.add_argument("--json", action="store_true",
+                     help="Emit JSON instead of pretty-printed table.")
+    cal.add_argument(
+        "--write-config", action="store_true",
+        help="Persist the recommended floor to [index].relevance_floor "
+             "in the user's config file (default ~/.config/longctx/config.toml).",
+    )
+    cal.add_argument(
+        "--config",
+        help="Override config-file path for --write-config "
+             "(default: platformdirs).",
+    )
+    cal.add_argument("--verbose", "-v", action="store_true")
+    cal.set_defaults(func=_cmd_calibrate)
+
     # --- version
     ver = sub.add_parser("version", help="Print version.")
     ver.set_defaults(func=_cmd_version)
@@ -1326,6 +1501,12 @@ def build_parser() -> argparse.ArgumentParser:
     clean_p.add_argument("--replay-older-than", default=None,
                          help="Delete interactions.jsonl shards older than "
                               "this duration.")
+    clean_p.add_argument("--disk-budget", type=float, default=None,
+                         metavar="GB",
+                         help="EXPERIMENTAL: enforce a soft cap on total "
+                              "cache footprint (Tier 3 disk-budget LRU "
+                              "eviction). Pass a value in GB; oldest-queried "
+                              "projects evict first until under budget.")
     clean_p.add_argument("--cache-dir", default=None,
                          help="Override cache dir (default ~/.cache/longctx).")
     clean_p.add_argument("--yes", "-y", action="store_true",

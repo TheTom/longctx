@@ -258,6 +258,36 @@ def _human_bytes(n: int) -> str:
 
 # ------------------------------------------------------------- CLI
 
+def collect_disk_budget(
+    cache_dir: Path, chunk_store, budget_gb: float,
+) -> list[CleanupDecision]:
+    """Tier 3 eviction plan as CleanupDecisions.
+
+    Defers to ``longctx_daemon.disk_budget.plan_eviction`` for the
+    actual LRU computation; this just adapts the result into the
+    ``CleanupDecision`` shape so it shares the dry-run UI with the
+    other collectors.
+    """
+    from longctx_daemon.disk_budget import plan_eviction
+
+    plan = plan_eviction(cache_dir, chunk_store, budget_gb=budget_gb)
+    if not plan.targets:
+        return []
+    out: list[CleanupDecision] = []
+    for name in plan.targets:
+        out.append(CleanupDecision(
+            target=name,
+            reason=(
+                f"LRU eviction: cache "
+                f"{_human_bytes(plan.pre_eviction_bytes)} > budget "
+                f"{_human_bytes(plan.budget_bytes)}"
+            ),
+            bytes_freed=_estimate_project_bytes(chunk_store, name),
+            kind="project",
+        ))
+    return out
+
+
 def cmd_clean(args: argparse.Namespace) -> int:
     """``longctx clean`` entry point.
 
@@ -295,6 +325,10 @@ def cmd_clean(args: argparse.Namespace) -> int:
             decisions.extend(collect_replay_shards(
                 interactions_dir,
                 parse_duration_seconds(args.replay_older_than),
+            ))
+        if args.disk_budget is not None and args.disk_budget > 0:
+            decisions.extend(collect_disk_budget(
+                cache_dir, chunk_store, budget_gb=args.disk_budget,
             ))
 
         if args.all and not (

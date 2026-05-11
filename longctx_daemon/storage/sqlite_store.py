@@ -565,6 +565,46 @@ class SqliteChunkStore:
             return tuple(int(r["id"]) for r in rows)
         return tuple(sorted(ids))
 
+    def get_chunk_ids_by_embedding_rows(
+        self, rows: Iterable[int],
+    ) -> dict[int, int]:
+        """Map embedding-store row → chunk.id. The searcher uses this
+        to normalize dense hits (which return row indices) into the
+        chunk.id key space before fusing with BM25 hits."""
+        rows_list = [r for r in rows if r is not None and r >= 0]
+        if not rows_list:
+            return {}
+        placeholders = ",".join("?" * len(rows_list))
+        with self._lock:
+            sql = (
+                f"SELECT id, embedding_row FROM chunks "
+                f"WHERE embedding_row IN ({placeholders})"
+            )
+            cur = self._conn.execute(sql, rows_list)
+            return {int(r["embedding_row"]): int(r["id"]) for r in cur.fetchall()}
+
+    def get_embedding_rows_by_chunk_ids(
+        self, ids: Iterable[int],
+    ) -> tuple[int, ...]:
+        """Inverse of ``get_chunk_ids_by_embedding_rows`` — map chunk.id
+        values to embedding-store row indices. Used by the searcher to
+        translate scope filters (which live in chunk.id space) into the
+        row-index space the embed store expects.
+        """
+        ids_list = [i for i in ids if i is not None and i >= 0]
+        if not ids_list:
+            return ()
+        placeholders = ",".join("?" * len(ids_list))
+        with self._lock:
+            sql = (
+                f"SELECT embedding_row FROM chunks "
+                f"WHERE id IN ({placeholders}) "
+                f"AND embedding_row IS NOT NULL"
+            )
+            cur = self._conn.execute(sql, ids_list)
+            rows = sorted({int(r["embedding_row"]) for r in cur.fetchall()})
+        return tuple(rows)
+
     def chunk_count(self, scope: Optional[ScopeFilter] = None) -> int:
         with self._lock:
             if scope is None or (scope.project is None and scope.project_in is None):

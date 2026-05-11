@@ -1,0 +1,83 @@
+[
+  {
+    "label": "clean (control)",
+    "query": "where is the secret needle hidden",
+    "needle_rank": 1,
+    "n_returned": 5,
+    "top1_fused_rrf": 0.032266458495966696,
+    "top1_dense_cosine": 0.7477716207504272,
+    "top1_bm25_raw": 3.4940109584583814,
+    "top1_file": "myapp/docs/notes.md"
+  },
+  {
+    "label": "multi-question",
+    "query": "where does ls appear and where is the secret needle and what is the capital of f",
+    "needle_rank": 1,
+    "n_returned": 5,
+    "top1_fused_rrf": 0.03252247488101534,
+    "top1_dense_cosine": 0.6161003112792969,
+    "top1_bm25_raw": 4.642856719099844,
+    "top1_file": "myapp/docs/notes.md"
+  },
+  {
+    "label": "run-on no-punc",
+    "query": "where does ls appear and where needle and france capital",
+    "needle_rank": 2,
+    "n_returned": 5,
+    "top1_fused_rrf": 0.03252247488101534,
+    "top1_dense_cosine": 0.40866413712501526,
+    "top1_bm25_raw": 1.4030168338748952,
+    "top1_file": "myapp/README.md"
+  },
+  {
+    "label": "blob+question",
+    "query": "Traceback (most recent call last):\n  File '/usr/lib/foo.py', line 42, in baz\n   ",
+    "needle_rank": 1,
+    "n_returned": 5,
+    "top1_fused_rrf": 0.032266458495966696,
+    "top1_dense_cosine": 0.6532520055770874,
+    "top1_bm25_raw": 5.378307686342429,
+    "top1_file": "myapp/docs/notes.md"
+  },
+  {
+    "label": "blob only (find similar)",
+    "query": "def auth_middleware(token: str) -> bool:\n    return token != ''",
+    "needle_rank": 3,
+    "n_returned": 5,
+    "top1_fused_rrf": 0.03225806451612903,
+    "top1_dense_cosine": 0.5037791132926941,
+    "top1_bm25_raw": 5.856082077788524,
+    "top1_file": "myapp/src/billing.py"
+  },
+  {
+    "label": "fragments",
+    "query": "needle find secret hidden where",
+    "needle_rank": 2,
+    "n_returned": 5,
+    "top1_fused_rrf": 0.03252247488101534,
+    "top1_dense_cosine": 0.48266318440437317,
+    "top1_bm25_raw": 3.2873135617589426,
+    "top1_file": "myapp/README.md"
+  },
+  {
+    "label": "typo",
+    "query": "where is the secret neddle hidden",
+    "needle_rank": 1,
+    "n_returned": 5,
+    "top1_fused_rrf": 0.032266458495966696,
+    "top1_dense_cosine": 0.6449235677719116,
+    "top1_bm25_raw": 2.0909941245834864,
+    "top1_file": "myapp/docs/notes.md"
+  },
+  {
+    "label": "off-corpus",
+    "query": "what is the capital of france",
+    "needle_rank": 1,
+    "n_returned": 5,
+    "top1_fused_rrf": 0.032266458495966696,
+    "top1_dense_cosine": 0.43913978338241577,
+    "top1_bm25_raw": 1.1488457606414626,
+    "top1_file": "myapp/docs/notes.md"
+  }
+]
+

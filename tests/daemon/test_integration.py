@@ -95,7 +95,7 @@ def stack(tmp_path: Path):
         chunk_store=chunk_store,
         embed_store=embed_store,
         embedder=embedder,
-        config=SearcherConfig(),
+        config=SearcherConfig(relevance_floor=0.0),
     )
 
     yield {
@@ -246,6 +246,50 @@ def test_search_scopes_to_cwd_project(stack, tmp_path):
     assert billing_result.scope_decision.primary_project == "billing-svc"
 
 
+def test_scoped_search_finds_chunk_on_embedding_row_zero(stack, tmp_path):
+    """Regression: the searcher used to hand SQLite chunk.ids (1-indexed)
+    to ``EmbedStore.search_dense`` as if they were embedding-row indices
+    (0-indexed). The chunk on embedding row 0 was silently masked out of
+    every scoped query because no chunk.id ever equals 0. Fix: searcher
+    translates chunk.id → embedding_row via
+    ``ChunkStore.get_embedding_rows_by_chunk_ids`` before calling
+    ``search_dense``. This test specifically requires the row-0 chunk to
+    surface in a scope-filtered search.
+    """
+    # One-project corpus with a single file → one chunk, lands on
+    # embedding_row 0 + chunk.id 1. Deterministic embedder maps
+    # "needle" text to a unit vector, so the planted chunk is the
+    # only match for a needle query.
+    proj = tmp_path / "myapp"
+    _build_corpus(proj, {
+        "src/auth.py": "def needle_handler():\n    return 'needle'\n",
+    })
+
+    stack["indexer"].add_project("myapp", proj)
+    stack["indexer"].full_scan("myapp")
+
+    # Sanity: the only chunk is on row 0 and has chunk.id 1.
+    all_ids = stack["chunk_store"].list_chunk_ids_in_scope(None)
+    assert all_ids == (1,)
+    rows = stack["chunk_store"].get_embedding_rows_by_chunk_ids(all_ids)
+    assert rows == (0,)
+
+    # Project-scoped search — pre-fix this returned 0 dense hits because
+    # the searcher passed chunk.id=1 to search_dense as a row index, and
+    # row 1 doesn't exist (only row 0 does).
+    result = stack["searcher"].search(
+        query="needle", cwd=str(proj),
+    )
+    assert result.chunks, (
+        "row-0 chunk must surface in scoped search; the searcher used to "
+        "drop it because chunk.id 1 was passed to search_dense as if it "
+        "were an embedding-row index"
+    )
+    paths = [c.citation.file_path for c in result.chunks]
+    assert any("auth.py" in p for p in paths), \
+        f"expected planted chunk in result, got {paths}"
+
+
 def test_explicit_project_arg_overrides_cwd(stack, tmp_path):
     """``project=`` arg takes precedence over cwd-walk."""
     auth = tmp_path / "auth-svc"
@@ -308,7 +352,7 @@ def test_index_survives_close_and_reopen(tmp_path):
 
     searcher = Searcher(
         chunk_store=chunk_store2, embed_store=embed_store2,
-        embedder=embedder, config=SearcherConfig(),
+        embedder=embedder, config=SearcherConfig(relevance_floor=0.0),
     )
     result = searcher.search(query="alpha", cwd=str(proj))
     assert result.chunks, "search should work after reopen"

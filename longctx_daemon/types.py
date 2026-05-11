@@ -100,11 +100,19 @@ class Citation:
 class SearchChunk:
     """A search result chunk + its citation + relevance.
     Distinct from ``Chunk`` (the persisted form) so the search response
-    type stays decoupled from the storage schema."""
+    type stays decoupled from the storage schema.
+
+    ``relevance_score`` is the fused RRF score (rank-driven, useful for
+    ordering but not absolute thresholding). ``dense_cosine`` is the
+    pre-fusion semantic match anchor — that's the field to threshold
+    on if you want to act per-chunk (e.g. drop borderline chunks). It
+    is ``None`` for hits that came purely from BM25 (no embedding
+    lookup happened for that chunk)."""
     citation: Citation
     text: str
     relevance_score: float
     token_count: int
+    dense_cosine: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -124,14 +132,63 @@ class SearchResult:
 
     Attributes:
         chunks: top-K hits in ranked order (highest relevance first).
+            Empty when ``no_relevant_results`` is True.
         freshness: per-response freshness signaling.
         scope_decision: which projects were searched + how the daemon
             picked them. Surfaced for observability — agents can ignore.
         latency_ms: per-stage timings, useful for the per-call MCP trace.
+        no_relevant_results: True when the top-1 dense cosine fell below
+            the configured ``relevance_floor``. The chunks are dropped
+            (returned empty) so the agent doesn't cite low-confidence
+            matches and gets a clean "I don't have anything for this"
+            signal. Anchored on dense cosine — NOT on the fused RRF
+            score, which is rank-driven (~0.032 for top-1 always) and
+            useless for thresholding.
+        top1_dense_cosine: the pre-fusion dense cosine for the highest-
+            ranked chunk in ANY query (max across rankings). Surfaced
+            so the agent / monitoring can see the actual semantic-match
+            anchor that drives ``no_relevant_results``. Equals 0.0 when
+            no chunks were considered.
+        query_type: classification of the input. ``"natural_language"``
+            (default) means an interrogative question or directive;
+            ``"find_similar"`` means the input looks like a code or
+            text blob the agent wants matched against the corpus
+            rather than answered. Lets the caller render results
+            differently (find-similar mode benefits from showing more
+            context than top-1; question mode stops at the answer).
     """
     chunks: tuple[SearchChunk, ...]
     freshness: SearchFreshness
     scope_decision: ScopeDecision
+    latency_ms: LatencyBreakdown
+    no_relevant_results: bool = False
+    top1_dense_cosine: float = 0.0
+    query_type: str = "natural_language"
+    confidence_gap: float = 0.0
+    """top1_dense_cosine − top2_dense_cosine. Big gap = clear winner;
+    near zero = top results are tied / a coin flip and the agent
+    should treat ranking as low-information. 0.0 when fewer than two
+    chunks were considered."""
+
+
+@dataclass(frozen=True)
+class MultiSearchResult:
+    """Response from the searcher's multi-question API
+    (``Searcher.search_multi`` / ``search_codebase`` with
+    ``query: list[str]``).
+
+    Each element of ``groups`` is one full ``SearchResult`` for one
+    sub-query. Order matches the input list. Results are NOT merged
+    or de-duplicated across groups — the caller needs to know which
+    chunks came from which sub-question.
+
+    Shared fields (scope_decision, freshness, total latency) live at
+    the top level so the per-call MCP trace stays compact.
+    """
+    queries: tuple[str, ...]
+    groups: tuple[SearchResult, ...]
+    scope_decision: ScopeDecision
+    freshness: SearchFreshness
     latency_ms: LatencyBreakdown
 
 

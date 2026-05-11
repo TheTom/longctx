@@ -115,11 +115,20 @@ class ServerConfig:
 
 @dataclass(frozen=True)
 class IndexConfigSection:
-    """``[index]`` section — embedder + chunking + disk budget. See PRD §4, §12.4.3."""
+    """``[index]`` section — embedder + chunking + disk budget. See PRD §4, §12.4.3.
+
+    ``relevance_floor`` is the per-corpus dense-cosine cutoff that drives
+    Phase 2.0.1's honest-retrieval behavior (``no_relevant_results=True``
+    when the top-1 dense cosine falls below the threshold). Default 0.50
+    is the safe-middle for a typical software-codebase corpus; per-
+    corpus tuning is what ``longctx calibrate`` is for. 0.0 disables the
+    floor entirely (legacy behavior — return whatever rank-1 wins).
+    """
     embedder: str = "BAAI/bge-small-en-v1.5"
     chunk_size: int = 2048
     chunk_overlap: int = 128
     disk_budget_gb: float = 0.0
+    relevance_floor: float = 0.50
 
 
 @dataclass(frozen=True)
@@ -398,6 +407,7 @@ def _config_to_dict(cfg: ServiceConfig) -> dict[str, Any]:
             "chunk_size": cfg.index.chunk_size,
             "chunk_overlap": cfg.index.chunk_overlap,
             "disk_budget_gb": cfg.index.disk_budget_gb,
+            "relevance_floor": cfg.index.relevance_floor,
         },
         "watcher": {
             "debounce_ms": cfg.watcher.debounce_ms,
@@ -497,6 +507,7 @@ def _config_from_dict(raw: dict[str, Any], source_path: Path) -> ServiceConfig:
         chunk_size=int(index_raw.get("chunk_size", 2048)),
         chunk_overlap=int(index_raw.get("chunk_overlap", 128)),
         disk_budget_gb=float(index_raw.get("disk_budget_gb", 0.0)),
+        relevance_floor=float(index_raw.get("relevance_floor", 0.50)),
     )
     watcher = WatcherConfigSection(
         debounce_ms=int(watcher_raw.get("debounce_ms", 200)),
@@ -614,6 +625,13 @@ def _validate(cfg: ServiceConfig) -> None:
     if cfg.index.disk_budget_gb < 0:
         raise ConfigError(
             f"[index].disk_budget_gb must be >= 0, got {cfg.index.disk_budget_gb}"
+        )
+    # 0.0 disables the floor; 1.0 would suppress everything (cosines are
+    # bounded in [-1, 1] but in practice in [0, 1]). >1 is nonsensical.
+    if not (0.0 <= cfg.index.relevance_floor <= 1.0):
+        raise ConfigError(
+            f"[index].relevance_floor must be in [0.0, 1.0], got "
+            f"{cfg.index.relevance_floor}"
         )
 
     # Watcher

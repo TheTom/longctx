@@ -95,6 +95,43 @@ class ChunkStore(Protocol):
         embeddings when only some chunks changed."""
         ...
 
+    def get_chunk_ids_by_embedding_rows(
+        self, rows: Iterable[int],
+    ) -> dict[int, int]:
+        """Map embedding-store row indices → chunk.id values.
+
+        ``EmbedStore.search_dense`` returns ``Hit.chunk_id`` populated
+        with the **embedding row index** (the memmap row), not the
+        SQLite chunk.id. The searcher uses this method to normalize
+        dense hits to the chunk.id key space before RRF fusion — when
+        BM25 hits and dense hits don't share a key space, RRF treats
+        the same chunk as two different documents and fusion silently
+        breaks.
+        """
+        ...
+
+    def get_embedding_rows_by_chunk_ids(
+        self, ids: Iterable[int],
+    ) -> tuple[int, ...]:
+        """Inverse of ``get_chunk_ids_by_embedding_rows`` — map a set of
+        chunk.id values to their embedding-store row indices.
+
+        ``EmbedStore.search_dense`` accepts an in-scope filter parameter
+        keyed on **embedding row indices**, not chunk.id values. The
+        scope filter the searcher computes is in chunk.id space (because
+        ``list_chunk_ids_in_scope`` returns chunk.ids), so it has to be
+        translated before it reaches the embed store. Without this
+        translation the wrong rows are masked out — the bug is silent
+        because chunk.id ≈ row at small/append-only scale, but as soon
+        as any chunk is deleted the row index and the chunk.id diverge
+        and the scope filter starts hiding the wrong rows.
+
+        Returns rows sorted ascending for deterministic top-K behavior.
+        Chunks without an assigned embedding row (NULL ``embedding_row``)
+        are skipped silently.
+        """
+        ...
+
     def delete_chunks_by_file(self, file_id: int) -> None:
         """Drop all chunks for a file_id without touching the file
         record itself. Used by the indexer's incremental-update path

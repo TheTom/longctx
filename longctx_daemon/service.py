@@ -337,25 +337,35 @@ class SystemdUserInstaller:
 # ---------------------------------------------------------- Windows
 
 class WindowsServiceInstaller:
-    """Windows Service installer. Phase 2.4 placeholder."""
+    """Windows Service installer — NOT supported in v1.
+
+    macOS launchd + Linux systemd are the supported platforms.
+    Windows users have two unsupported paths: run ``longctx serve``
+    inside Task Scheduler, or run ``longctx serve --daemon`` and
+    handle restart-on-reboot manually. Community PRs that wire
+    pywin32 into a real ``ServiceInstaller`` impl are welcome.
+    """
 
     LABEL = "longctx"
+    _MSG = (
+        "Windows Service auto-install is not supported in v1. Use "
+        "`longctx serve --daemon` directly, or wrap it in Windows "
+        "Task Scheduler. macOS + Linux are the supported daemon "
+        "platforms; community PRs welcome at "
+        "https://github.com/TheTom/longctx."
+    )
 
     def install(self, *, executable, corpus_dir=None, env=None):  # noqa: ANN001
-        raise NotImplementedError(
-            "Windows Service installer ships in Phase 2.4. For now, "
-            "run `longctx serve --daemon` directly or use Task Scheduler. "
-            "See docs/PRD-phase2-mcp-daemon.md §9.3."
-        )
+        raise NotImplementedError(self._MSG)
 
     def uninstall(self) -> None:
-        raise NotImplementedError("Windows installer ships in Phase 2.4")
+        raise NotImplementedError(self._MSG)
 
     def start(self) -> None:
-        raise NotImplementedError("Windows installer ships in Phase 2.4")
+        raise NotImplementedError(self._MSG)
 
     def stop(self) -> None:
-        raise NotImplementedError("Windows installer ships in Phase 2.4")
+        raise NotImplementedError(self._MSG)
 
     def status(self) -> ServiceState:
         return ServiceState(

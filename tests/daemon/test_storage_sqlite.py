@@ -527,6 +527,61 @@ def test_list_chunk_ids_in_scope_filters_by_project(
     assert set(ids_a).isdisjoint(set(ids_b))
 
 
+def test_get_embedding_rows_by_chunk_ids_translates_id_to_row(
+    store: SqliteChunkStore, tmp_path: Path,
+) -> None:
+    """Inverse of get_chunk_ids_by_embedding_rows. The Searcher uses
+    this method to translate a chunk-id-space scope filter into the
+    row-space the EmbedStore expects. Returns rows sorted ascending
+    so brute-force cosine ordering is deterministic."""
+    store.upsert_project(Project(name="p", root_path=str(tmp_path / "p")))
+    fid = store.upsert_file(FileRecord(
+        id=0, project="p", rel_path="x.py", mtime=1, size_bytes=1,
+        content_hash="z" * 64,
+    ))
+    store.upsert_chunks([
+        Chunk(
+            id=0, file_id=fid, chunk_index=i, start_offset=i, end_offset=i + 1,
+            start_line=i, end_line=i + 1, token_count=1, content_hash=f"{i:064x}",
+            text=f"t{i}", embedder_model="m", embedder_sha256="s",
+            embedding_row=10 + i,  # deliberate id ≠ row offset
+        )
+        for i in range(3)
+    ])
+    ids = list(store.list_chunk_ids_in_scope(None))
+    rows = store.get_embedding_rows_by_chunk_ids(ids)
+    assert rows == (10, 11, 12)
+    # Round-trip: row → id → row preserves the set
+    id_by_row = store.get_chunk_ids_by_embedding_rows(rows)
+    round_trip = store.get_embedding_rows_by_chunk_ids(id_by_row.values())
+    assert round_trip == (10, 11, 12)
+
+
+def test_get_embedding_rows_skips_chunks_without_row(
+    store: SqliteChunkStore, tmp_path: Path,
+) -> None:
+    """Chunks with embedding_row IS NULL (e.g., upserted-but-not-embedded
+    yet) are silently dropped from the result so they don't pollute the
+    in-scope filter the EmbedStore consumes."""
+    store.upsert_project(Project(name="p", root_path=str(tmp_path / "p")))
+    fid = store.upsert_file(FileRecord(
+        id=0, project="p", rel_path="x.py", mtime=1, size_bytes=1,
+        content_hash="z" * 64,
+    ))
+    store.upsert_chunks([
+        Chunk(
+            id=0, file_id=fid, chunk_index=i, start_offset=i, end_offset=i + 1,
+            start_line=i, end_line=i + 1, token_count=1, content_hash=f"{i:064x}",
+            text=f"t{i}", embedder_model="m", embedder_sha256="s",
+            embedding_row=i if i < 2 else None,  # third chunk has no embedding
+        )
+        for i in range(3)
+    ])
+    ids = list(store.list_chunk_ids_in_scope(None))
+    rows = store.get_embedding_rows_by_chunk_ids(ids)
+    assert rows == (0, 1)  # third chunk dropped
+
+
 def test_list_chunk_ids_in_scope_project_in_filter(
     store: SqliteChunkStore, tmp_path: Path,
 ) -> None:

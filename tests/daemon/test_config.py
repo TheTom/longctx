@@ -89,6 +89,7 @@ class TestDefaults:
         assert cfg.index.chunk_size == 2048
         assert cfg.index.chunk_overlap == 128
         assert cfg.index.disk_budget_gb == 0.0
+        assert cfg.index.relevance_floor == 0.50
 
     def test_default_watcher_section(self):
         cfg = default_config()

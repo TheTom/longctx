@@ -31,6 +31,7 @@ from longctx_daemon.types import (
     Citation,
     Hit,
     LatencyBreakdown,
+    MultiSearchResult,
     ScopeDecision,
     ScopeFilter,
     SearchChunk,
@@ -89,6 +90,82 @@ def _rrf_score(rank: int, k: int = 60) -> float:
     return 1.0 / (k + rank)
 
 
+# Lightweight code-token regex used by ``classify_query_type``. Matches
+# things that strongly suggest a code paste rather than a question:
+# parenthesis-followed identifiers, dunder names, brace blocks, common
+# language keywords with structural punctuation. Deliberately
+# conservative — we only want to flag the obvious blob cases. Natural-
+# language sentences that mention code names ("the foo() function") DO
+# NOT trip these patterns.
+_CODE_BLOB_RE = re.compile(
+    r"(?:"
+    r"\bdef\s+\w+\s*\("                       # python def
+    r"|\bclass\s+\w+\s*[:(]"                  # class declaration
+    r"|\bfunction\s+\w+\s*\("                 # JS/TS function decl
+    r"|\bfunc\s+\w+\s*\("                     # Go / Swift func decl
+    r"|\bfn\s+\w+\s*\("                       # Rust fn decl
+    r"|\bimport\s+\w[\w.]*"                   # import statements
+    r"|^\s*(?:from\s+\w[\w.]*\s+import|require\s*\()"   # py from / node require
+    r"|\}\s*else\s*\{"                        # } else { block
+    r"|\)\s*->\s*\w"                          # type-arrow return
+    r"|^\s*//\s|^\s*#\s*[A-Z]"                # comment-led code
+    r"|::\w+\s*\("                            # C++/Rust :: call
+    r")",
+    re.MULTILINE,
+)
+_INTERROGATIVE_RE = re.compile(
+    r"\b(?:what|where|when|who|why|how|which|"
+    r"is|are|does|do|did|can|could|should|would|will|won't|isn't|aren't|"
+    r"show|tell|find|give|explain|describe|list|name)\b",
+    re.IGNORECASE,
+)
+_TRACEBACK_RE = re.compile(
+    r"(?:Traceback\s*\(|\bat\s+\w[\w./]*\.\w+:\d+|"
+    r"^\s*File\s+['\"][^'\"]+['\"],\s*line\s+\d+)",
+    re.MULTILINE,
+)
+
+
+def classify_query_type(query: str) -> str:
+    """Classify ``query`` as ``"natural_language"`` or ``"find_similar"``.
+
+    Heuristic-based; deliberately conservative. The goal is to flag
+    the obvious code-blob / paste-with-question cases without false-
+    flagging natural-language questions that happen to mention code
+    identifiers.
+
+    Decision tree:
+      1. Multi-line input + (code-block pattern OR traceback marker)
+         → ``find_similar``. Pasted stack traces and code snippets
+         almost always span multiple lines.
+      2. Single-line input → never ``find_similar``. Even if the line
+         contains code (``where is auth_middleware``), the
+         interrogative-only-on-one-line case is overwhelmingly a
+         question, not a find-similar request.
+      3. Multi-line + interrogative cue at start/end (e.g. blob pasted
+         then "where is this?" appended) → still ``natural_language``
+         because the agent likely DID intend to ask a question; the
+         relevance-floor + score will determine if it works.
+      4. Multi-line + code blob and NO interrogative anywhere
+         → ``find_similar``.
+
+    The Phase 2.0.1 contract is to TAG the result, not to change
+    ranking. Future iterations can swap modes (e.g. dense-only on
+    full blob for find_similar) once we observe how callers use
+    the tag.
+    """
+    if not query or "\n" not in query:
+        return "natural_language"
+    has_code = bool(_CODE_BLOB_RE.search(query))
+    has_traceback = bool(_TRACEBACK_RE.search(query))
+    if not (has_code or has_traceback):
+        return "natural_language"
+    has_interrogative = bool(_INTERROGATIVE_RE.search(query))
+    if has_interrogative:
+        return "natural_language"
+    return "find_similar"
+
+
 def _utc_now_iso() -> str:
     """ISO-8601 UTC timestamp with a trailing ``Z`` (per spec §6.3)."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
@@ -124,6 +201,17 @@ class SearcherConfig:
         chars_per_token: rough heuristic used as a fallback when a chunk
             has no recorded ``token_count``. ~4 chars/token matches
             sentencepiece-style BPE on English code-and-prose.
+        relevance_floor: minimum top-1 dense cosine for a result to be
+            considered "real". Below this, ``Searcher.search`` returns
+            empty chunks + ``no_relevant_results=True`` instead of a
+            low-confidence false positive (e.g. off-corpus questions
+            like "capital of france" sit at ~0.44 against a code corpus
+            and used to confidently return wrong chunks). Anchored on
+            DENSE COSINE, not the fused RRF score, because RRF is
+            rank-driven (~0.032 for top-1 always). Calibration data:
+            benchmark/messy_queries/RESULTS.md. Defensible default 0.50;
+            clean matches sit at 0.6+, noise at 0.4-0.5. Set to 0.0 to
+            disable the filter entirely.
     """
     rrf_k: int = 60
     bm25_weight: float = 1.0
@@ -131,6 +219,7 @@ class SearcherConfig:
     default_top_k_for_fusion: int = 1000
     default_wait_for_quiescence_ms: int = 500
     chars_per_token: int = 4
+    relevance_floor: float = 0.50
 
 
 # ------------------------------------------------------------- scope routing
@@ -408,6 +497,7 @@ class Searcher:
         wait_for_quiescence_ms: Optional[int] = None,
         active_project_sticky: Optional[str] = None,
         paraphrases: tuple[str, ...] = (),
+        relevance_floor: Optional[float] = None,
     ) -> SearchResult:
         """Run one search end-to-end and return a ``SearchResult``.
 
@@ -420,6 +510,14 @@ class Searcher:
         paraphrases via a side-channel LLM call). Keeping the parameter
         on the searcher means the multi-query fusion code path is
         unit-testable without standing up the MCP transport.
+
+        ``relevance_floor`` overrides ``SearcherConfig.relevance_floor``
+        per call (e.g. an agent that wants raw results passes 0.0;
+        an agent that wants strict honesty passes 0.65). The floor
+        gates on TOP-1 DENSE COSINE, not the fused RRF score. When the
+        top-1 cosine falls below it, ``chunks`` returns empty and
+        ``no_relevant_results=True`` so the agent knows the corpus
+        had nothing for this question.
         """
         # ---- Stage: scope decision (cheap, but timed for completeness)
         projects = self._list_indexed_projects()
@@ -470,11 +568,37 @@ class Searcher:
         dense_rankings: list[tuple[Hit, ...]] = []
         t0 = time.perf_counter()
         if self._config.dense_weight > 0:
-            scope_chunk_ids = self._scope_to_chunk_ids(scope)
+            scope_embedding_rows = self._scope_to_embedding_rows(scope)
+            raw_dense_rankings: list[tuple[Hit, ...]] = []
             for emb in query_embs:
-                dense_rankings.append(
-                    self._embed_store.search_dense(emb, top_n, scope_chunk_ids)
+                raw_dense_rankings.append(
+                    self._embed_store.search_dense(
+                        emb, top_n, scope_embedding_rows,
+                    )
                 )
+            # Normalize: ``EmbedStore.search_dense`` returns row indices
+            # in ``Hit.chunk_id``, not chunk.id. Translate so RRF fuses
+            # against the same key space as BM25 hits (which DO emit
+            # real chunk.id values). Without this, the same chunk
+            # appears under two different keys and fusion silently
+            # double-counts / mis-orders.
+            row_set: set[int] = set()
+            for ranking in raw_dense_rankings:
+                row_set.update(h.chunk_id for h in ranking)
+            row_to_chunk_id: dict[int, int] = {}
+            if row_set:
+                getter = getattr(
+                    self._chunk_store, "get_chunk_ids_by_embedding_rows",
+                    None,
+                )
+                if callable(getter):
+                    row_to_chunk_id = getter(row_set) or {}
+            for ranking in raw_dense_rankings:
+                normalized: list[Hit] = []
+                for h in ranking:
+                    cid = row_to_chunk_id.get(h.chunk_id, h.chunk_id)
+                    normalized.append(Hit(chunk_id=cid, score=h.score))
+                dense_rankings.append(tuple(normalized))
         dense_ms = (time.perf_counter() - t0) * 1000.0
 
         # ---- Stage: rrf_fuse
@@ -484,41 +608,103 @@ class Searcher:
         # materializing chunks that won't make it past the token budget.
         cap = max_results if max_results is not None else top_n
         fused = fused[:max(cap, 1)]
+
+        # Build chunk_id → max-cosine-across-queries map. Dense store
+        # returns chunk-row indices keyed as ``Hit.chunk_id``. Same key
+        # space the searcher uses across the rest of the pipeline.
+        # Skip BM25-only hits (they have no dense entry).
+        dense_cosine_by_id: dict[int, float] = {}
+        for ranking in dense_rankings:
+            for hit in ranking:
+                prev = dense_cosine_by_id.get(hit.chunk_id, -1.0)
+                if hit.score > prev:
+                    dense_cosine_by_id[hit.chunk_id] = float(hit.score)
         rrf_ms = (time.perf_counter() - t0) * 1000.0
+
+        # Top-1 dense cosine drives the relevance floor. Anchor on the
+        # FUSED RANK-1 CHUNK specifically — not the global max-cosine
+        # across all chunks. The user's question is "is the thing I'm
+        # about to return actually relevant?", so we test the chunk
+        # the agent will see, not whichever-chunk-had-a-good-match-
+        # somewhere. This is the strict honest-retrieval reading and
+        # what the messy-query data points at: run-on / fragment / off-
+        # corpus all have fused-rank-1 cosines ≤ 0.49, which we want
+        # to suppress.
+        top1_cosine = 0.0
+        top2_cosine = 0.0
+        if fused:
+            top1_cosine = dense_cosine_by_id.get(fused[0][0], 0.0)
+            if len(fused) >= 2:
+                top2_cosine = dense_cosine_by_id.get(fused[1][0], 0.0)
+        confidence_gap = max(0.0, top1_cosine - top2_cosine)
+
+        # Classify query shape (natural-language vs find-similar).
+        # Tag-only for Phase 2.0.1 — does not change ranking. Lets the
+        # agent render results differently for code-blob inputs.
+        query_type = classify_query_type(query)
+
+        # Apply the relevance floor BEFORE materializing chunks: if the
+        # top-1 dense cosine is below threshold, we know the chunks
+        # would be low-confidence noise, so skip the fetch + return
+        # the no-results signal. This is the "honest" path — better to
+        # tell the agent we have nothing than ship false positives.
+        #
+        # Two cases skip the floor entirely:
+        #   * floor <= 0 → user explicitly disabled the filter
+        #   * dense_weight <= 0 → no dense signal to anchor on; the
+        #     floor is meaningless and applying it would zero out
+        #     pure-BM25 callers. They get a permissive pass through.
+        floor = (
+            relevance_floor
+            if relevance_floor is not None
+            else self._config.relevance_floor
+        )
+        no_relevant_results = (
+            floor > 0.0
+            and self._config.dense_weight > 0
+            and (not fused or top1_cosine < floor)
+        )
 
         # ---- Stage: fetch_chunks
         t0 = time.perf_counter()
-        chunks_by_id = {
-            c.id: c
-            for c in self._chunk_store.get_chunks_by_id([cid for cid, _ in fused])
-        }
-        ranked_chunks = [
-            (chunks_by_id[cid], score)
-            for cid, score in fused
-            if cid in chunks_by_id
-        ]
-        # Token-budget enforcement: greedy take-until-overflow. Ordered by
-        # fused score so the highest-relevance chunks are kept.
         kept: list[tuple[int, SearchChunk]] = []
-        budget = max_tokens
-        for chunk, score in ranked_chunks:
-            tok = self._chunk_token_count(chunk)
-            if tok > budget:
-                # Single chunk overflows; stop here so we never exceed the cap.
-                break
-            citation = self._build_citation(chunk)
-            kept.append((
-                chunk.id,
-                SearchChunk(
-                    citation=citation,
-                    text=chunk.text,
-                    relevance_score=float(score),
-                    token_count=tok,
-                ),
-            ))
-            budget -= tok
-            if max_results is not None and len(kept) >= max_results:
-                break
+        if not no_relevant_results:
+            chunks_by_id = {
+                c.id: c
+                for c in self._chunk_store.get_chunks_by_id(
+                    [cid for cid, _ in fused],
+                )
+            }
+            ranked_chunks = [
+                (chunks_by_id[cid], score)
+                for cid, score in fused
+                if cid in chunks_by_id
+            ]
+            # Token-budget enforcement: greedy take-until-overflow.
+            # Ordered by fused score so the highest-relevance chunks
+            # are kept.
+            budget = max_tokens
+            for chunk, score in ranked_chunks:
+                tok = self._chunk_token_count(chunk)
+                if tok > budget:
+                    # Single chunk overflows; stop here so we never
+                    # exceed the cap.
+                    break
+                citation = self._build_citation(chunk)
+                cos = dense_cosine_by_id.get(chunk.id)
+                kept.append((
+                    chunk.id,
+                    SearchChunk(
+                        citation=citation,
+                        text=chunk.text,
+                        relevance_score=float(score),
+                        token_count=tok,
+                        dense_cosine=cos,
+                    ),
+                ))
+                budget -= tok
+                if max_results is not None and len(kept) >= max_results:
+                    break
         fetch_ms = (time.perf_counter() - t0) * 1000.0
 
         # ---- Freshness
@@ -551,6 +737,120 @@ class Searcher:
             freshness=freshness,
             scope_decision=scope,
             latency_ms=latency,
+            no_relevant_results=no_relevant_results,
+            top1_dense_cosine=top1_cosine,
+            query_type=query_type,
+            confidence_gap=confidence_gap,
+        )
+
+    # ---------------------------------------------------- multi-question API
+
+    def search_multi(
+        self,
+        queries: Sequence[str],
+        *,
+        cwd: Optional[str] = None,
+        project: Optional[str] = None,
+        max_tokens: int = 4096,
+        max_results: Optional[int] = None,
+        wait_for_quiescence_ms: Optional[int] = None,
+        active_project_sticky: Optional[str] = None,
+        relevance_floor: Optional[float] = None,
+    ) -> MultiSearchResult:
+        """Run N independent searches for N sub-queries.
+
+        Each sub-query goes through the full BM25 + dense + RRF pipeline
+        on its own. Results are NOT merged or de-duplicated across
+        groups — the caller needs to know which chunks came from which
+        sub-question. ``max_tokens`` is per-group (the caller's budget
+        is shared across groups; we don't try to enforce a global cap
+        because the caller has more context for that decision).
+
+        The shared response fields (``scope_decision``, ``freshness``,
+        total ``latency_ms``) collapse the per-group values:
+          - ``scope_decision`` is taken from the FIRST query (typically
+            the agent's primary intent; subsequent queries usually
+            inherit the same scope).
+          - ``freshness`` is the worst-case across groups: if any group
+            saw stale data, the whole response reports stale.
+          - ``latency_ms.total`` is the SUM of all groups' totals; the
+            per-stage breakdown sums each stage.
+
+        Args mirror ``search`` plus accept a Sequence of queries instead
+        of a string + paraphrases. Empty list → empty MultiSearchResult
+        with a synthetic scope_decision (no_primary, no fanout) and
+        zeroed freshness; doesn't raise.
+        """
+        queries_t = tuple(queries)
+        if not queries_t:
+            now_iso = _utc_now_iso()
+            empty_scope = ScopeDecision(
+                primary_project=None,
+                primary_source="fanout_no_primary",
+                fanout_projects=(),
+                cross_project_pattern_matched=None,
+                active_project_sticky=active_project_sticky,
+            )
+            return MultiSearchResult(
+                queries=(),
+                groups=(),
+                scope_decision=empty_scope,
+                freshness=SearchFreshness(
+                    is_fully_fresh=True, pending_updates=0,
+                    indexed_through=now_iso, stale_files=(),
+                ),
+                latency_ms=LatencyBreakdown(),
+            )
+
+        groups: list[SearchResult] = []
+        for q in queries_t:
+            groups.append(self.search(
+                q,
+                cwd=cwd,
+                project=project,
+                max_tokens=max_tokens,
+                max_results=max_results,
+                wait_for_quiescence_ms=wait_for_quiescence_ms,
+                active_project_sticky=active_project_sticky,
+                relevance_floor=relevance_floor,
+            ))
+
+        # ---- Collapse shared fields
+        first_scope = groups[0].scope_decision
+        any_stale = any(not g.freshness.is_fully_fresh for g in groups)
+        max_pending = max(g.freshness.pending_updates for g in groups)
+        # Earliest indexed_through wins (oldest snapshot dominates).
+        # ISO-8601 strings sort lexicographically when zero-padded, so
+        # min() on the strings is correct.
+        oldest_indexed_through = min(
+            g.freshness.indexed_through for g in groups
+        )
+        # Union of stale files across groups
+        stale_union: set[str] = set()
+        for g in groups:
+            stale_union.update(g.freshness.stale_files)
+        merged_freshness = SearchFreshness(
+            is_fully_fresh=not any_stale and max_pending == 0,
+            pending_updates=max_pending,
+            indexed_through=oldest_indexed_through,
+            stale_files=tuple(sorted(stale_union)),
+        )
+        # Sum stage timings across groups.
+        total_lat = LatencyBreakdown(
+            wait_quiescence=sum(g.latency_ms.wait_quiescence for g in groups),
+            embed_query=sum(g.latency_ms.embed_query for g in groups),
+            bm25_score=sum(g.latency_ms.bm25_score for g in groups),
+            dense_score=sum(g.latency_ms.dense_score for g in groups),
+            rrf_fuse=sum(g.latency_ms.rrf_fuse for g in groups),
+            fetch_chunks=sum(g.latency_ms.fetch_chunks for g in groups),
+            total=sum(g.latency_ms.total for g in groups),
+        )
+        return MultiSearchResult(
+            queries=queries_t,
+            groups=tuple(groups),
+            scope_decision=first_scope,
+            freshness=merged_freshness,
+            latency_ms=total_lat,
         )
 
     # --------------------------------------------------------- internals
@@ -581,14 +881,24 @@ class Searcher:
             return ScopeFilter(project=fanout[0])
         return ScopeFilter(project_in=fanout)
 
-    def _scope_to_chunk_ids(
+    def _scope_to_embedding_rows(
         self, scope: ScopeDecision
     ) -> Optional[tuple[int, ...]]:
-        """Resolve a scope to the chunk-id allow-list for ``search_dense``.
+        """Resolve a scope to the embedding-row allow-list that
+        ``EmbedStore.search_dense`` actually consumes.
 
-        ``EmbedStore.search_dense`` doesn't take a ``ScopeFilter`` — it
-        takes ``chunk_ids_in_scope``. So when fanout is non-empty we
-        ask the chunk store which chunk-ids belong to those projects.
+        Two key spaces collide here:
+          * ``ChunkStore.list_chunk_ids_in_scope`` returns SQLite
+            chunk.id values (1-indexed PKs).
+          * ``EmbedStore.search_dense``'s scope-filter parameter is
+            keyed on **embedding row indices** (0-indexed memmap rows).
+
+        Earlier versions of this method handed chunk.ids straight to
+        ``search_dense``, which silently masked the wrong rows whenever
+        chunk.id ≠ embedding_row (any time chunks were deleted or
+        re-embedded). The bug surfaces as the row-0 chunk being
+        invisible in scoped dense search. The fix is to translate via
+        ``ChunkStore.get_embedding_rows_by_chunk_ids`` before returning.
 
         Returns ``None`` for global search (no filter) — equivalent to
         passing ``ScopeFilter(project=None, project_in=None)``.
@@ -602,14 +912,23 @@ class Searcher:
         scope_filter = self._scope_to_filter(scope)
         if scope_filter is None:
             return None
-        # Light path: query the chunk store for the ids in scope.
-        # Sorting keeps brute-force cosine deterministic across runs.
-        ids = sorted(
-            getattr(self._chunk_store, "list_chunk_ids_in_scope", lambda f: ())(
-                scope_filter,
-            )
+        chunk_ids = getattr(
+            self._chunk_store, "list_chunk_ids_in_scope", lambda f: ()
+        )(scope_filter)
+        if not chunk_ids:
+            return ()
+        # Translate chunk.id → embedding_row. The store sorts the result
+        # ascending so brute-force cosine ordering stays deterministic
+        # across runs.
+        translator = getattr(
+            self._chunk_store, "get_embedding_rows_by_chunk_ids", None,
         )
-        return tuple(ids)
+        if callable(translator):
+            return tuple(translator(chunk_ids) or ())
+        # Fallback for chunk-store implementations that don't (yet) have
+        # the translator: pass chunk.ids and accept the latent bug. Real
+        # impls (SqliteChunkStore) always have the translator.
+        return tuple(sorted(chunk_ids))
 
     def _wait_quiescence(
         self, project: Optional[str], timeout_ms: int,
