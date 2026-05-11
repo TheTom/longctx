@@ -840,6 +840,70 @@ class TestAutoPolicyAndSignals:
         # planted-needle text, vs ~0 for unrelated
         assert result.retrieval_quality in {"high", "medium"}
 
+    def test_per_project_floor_overrides_global(self):
+        """SearcherConfig.project_floors[primary_project] takes
+        precedence over the global relevance_floor for that project."""
+        chunks_text = [
+            (1, 1, "longctx", "the secret needle is here"),
+            (2, 2, "obsidian-vault", "the secret needle is here"),
+        ]
+        store, embeds, embedder = _build_corpus(
+            chunks_text, project_names=("longctx", "obsidian-vault"),
+        )
+        # Per-project: longctx 0.0 (always pass), obsidian-vault 0.99
+        # (always abstain). Global is 0.50. The keyword embedder
+        # produces cos=1 for "needle" against both — so longctx
+        # passes, obsidian-vault fails.
+        config = SearcherConfig(
+            relevance_floor=0.50,
+            project_floors={"longctx": 0.0, "obsidian-vault": 0.99},
+        )
+        searcher = _build_searcher(
+            store, embeds, embedder, config=config,
+        )
+        # longctx scope: floor=0.0 → results returned
+        r1 = searcher.search("needle", cwd="/tmp/longctx")
+        assert r1.no_relevant_results is False
+        assert len(r1.chunks) > 0
+
+    def test_per_project_floor_falls_back_to_global(self):
+        """When the resolved project isn't in project_floors, fall
+        back to the global relevance_floor."""
+        chunks_text = [(1, 1, "longctx", "the secret needle here")]
+        store, embeds, embedder = _build_corpus(chunks_text)
+        # longctx not in project_floors → use global 0.0 → always pass
+        config = SearcherConfig(
+            relevance_floor=0.0,
+            project_floors={"some-other-project": 0.99},
+        )
+        searcher = _build_searcher(
+            store, embeds, embedder, config=config,
+        )
+        r = searcher.search("needle", cwd="/tmp/longctx")
+        assert r.no_relevant_results is False
+
+    def test_explicit_floor_arg_beats_per_project_via_zero_disable(self):
+        """relevance_floor=0.0 per call disables abstention even when
+        project_floors would have applied a tight floor. Validates the
+        per-call override sits at the top of the priority chain."""
+        chunks_text = [(1, 1, "longctx", "needle here")]
+        store, embeds, embedder = _build_corpus(chunks_text)
+        config = SearcherConfig(
+            relevance_floor=0.99,
+            project_floors={"longctx": 0.99},  # both would abstain
+        )
+        searcher = _build_searcher(
+            store, embeds, embedder, config=config,
+        )
+        # Per-call 0.0 disables the floor entirely, overriding both
+        # the project-specific 0.99 and the global 0.99
+        r = searcher.search(
+            "totally off corpus", cwd="/tmp/longctx",
+            relevance_floor=0.0,
+        )
+        # floor=0.0 → never abstain
+        assert r.no_relevant_results is False
+
     def test_compute_retrieval_quality_thresholds(self):
         """Unit-test the retrieval_quality classifier directly with
         crafted (top1_cosine, gap, no_rel, n_chunks) inputs — avoids

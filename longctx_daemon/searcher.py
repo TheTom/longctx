@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Optional, Sequence
 
@@ -220,6 +220,12 @@ class SearcherConfig:
     default_wait_for_quiescence_ms: int = 500
     chars_per_token: int = 4
     relevance_floor: float = 0.50
+    project_floors: dict[str, float] = field(default_factory=dict)
+    """Per-project floor overrides — when the search's primary project
+    matches a key, that floor takes precedence over ``relevance_floor``.
+    Phase 3 dogfood-audit found 0.50 doesn't generalize across corpus
+    types; populated via ``longctx calibrate --project NAME --write-config``
+    (Phase 3 follow-up). Empty dict (default) keeps the global floor."""
 
 
 # ------------------------------------------------------------- scope routing
@@ -679,11 +685,23 @@ class Searcher:
         #   * dense_weight <= 0 → no dense signal to anchor on; the
         #     floor is meaningless and applying it would zero out
         #     pure-BM25 callers. They get a permissive pass through.
-        floor = (
-            relevance_floor
-            if relevance_floor is not None
-            else self._config.relevance_floor
-        )
+        # Floor resolution priority:
+        #   1. per-call ``relevance_floor`` arg (explicit override)
+        #   2. per-project floor from ``SearcherConfig.project_floors``
+        #      keyed on the resolved primary project
+        #   3. global ``SearcherConfig.relevance_floor``
+        # Phase 3 dogfood-audit (2026-05-09) found 0.50 doesn't
+        # generalize across corpus types — code corpora typically
+        # work at 0.50, mixed at ~0.60, prose-heavy at ~0.65.
+        if relevance_floor is not None:
+            floor = relevance_floor
+        else:
+            primary = scope.primary_project
+            project_floors = getattr(self._config, "project_floors", {}) or {}
+            if primary and primary in project_floors:
+                floor = project_floors[primary]
+            else:
+                floor = self._config.relevance_floor
         no_relevant_results = (
             floor > 0.0
             and effective_dense_weight > 0

@@ -117,18 +117,29 @@ class ServerConfig:
 class IndexConfigSection:
     """``[index]`` section — embedder + chunking + disk budget. See PRD §4, §12.4.3.
 
-    ``relevance_floor`` is the per-corpus dense-cosine cutoff that drives
-    Phase 2.0.1's honest-retrieval behavior (``no_relevant_results=True``
-    when the top-1 dense cosine falls below the threshold). Default 0.50
-    is the safe-middle for a typical software-codebase corpus; per-
-    corpus tuning is what ``longctx calibrate`` is for. 0.0 disables the
-    floor entirely (legacy behavior — return whatever rank-1 wins).
+    ``relevance_floor`` is the corpus-wide default dense-cosine cutoff
+    that drives Phase 2.0.1's honest-retrieval behavior
+    (``no_relevant_results=True`` when the top-1 dense cosine falls
+    below the threshold). Default 0.50 is the safe-middle for a
+    typical software-codebase corpus; per-corpus tuning is what
+    ``longctx calibrate`` is for. 0.0 disables the floor entirely
+    (legacy behavior — return whatever rank-1 wins).
+
+    ``project_floors`` is the per-project override map. Keys are
+    project names (matching ``Project.name``), values are floors
+    that apply when the search scope resolves to that project.
+    Phase 3 dogfood-audit found that 0.50 doesn't generalize — code
+    corpora typically work at 0.50, mixed-content (docs+tests+code)
+    needs ~0.60, prose-heavy corpora (knowledge bases / wikis) need
+    ~0.65. Use ``longctx calibrate --project NAME --write-config``
+    to populate.
     """
     embedder: str = "BAAI/bge-small-en-v1.5"
     chunk_size: int = 2048
     chunk_overlap: int = 128
     disk_budget_gb: float = 0.0
     relevance_floor: float = 0.50
+    project_floors: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -408,6 +419,7 @@ def _config_to_dict(cfg: ServiceConfig) -> dict[str, Any]:
             "chunk_overlap": cfg.index.chunk_overlap,
             "disk_budget_gb": cfg.index.disk_budget_gb,
             "relevance_floor": cfg.index.relevance_floor,
+            "project_floors": dict(cfg.index.project_floors),
         },
         "watcher": {
             "debounce_ms": cfg.watcher.debounce_ms,
@@ -502,12 +514,27 @@ def _config_from_dict(raw: dict[str, Any], source_path: Path) -> ServiceConfig:
         mcp_host=str(server_raw.get("mcp_host", "127.0.0.1")),
         mcp_transports=tuple(server_raw.get("mcp_transports", ("sse", "streamable-http"))),
     )
+    project_floors_raw = index_raw.get("project_floors", {}) or {}
+    if not isinstance(project_floors_raw, dict):
+        raise ConfigError(
+            f"[index].project_floors must be a table mapping project "
+            f"names to floors, got {type(project_floors_raw).__name__}"
+        )
+    project_floors: dict[str, float] = {}
+    for k, v in project_floors_raw.items():
+        try:
+            project_floors[str(k)] = float(v)
+        except (TypeError, ValueError) as e:
+            raise ConfigError(
+                f"[index].project_floors[{k!r}] must be a number, got {v!r}"
+            ) from e
     index = IndexConfigSection(
         embedder=str(index_raw.get("embedder", "BAAI/bge-small-en-v1.5")),
         chunk_size=int(index_raw.get("chunk_size", 2048)),
         chunk_overlap=int(index_raw.get("chunk_overlap", 128)),
         disk_budget_gb=float(index_raw.get("disk_budget_gb", 0.0)),
         relevance_floor=float(index_raw.get("relevance_floor", 0.50)),
+        project_floors=project_floors,
     )
     watcher = WatcherConfigSection(
         debounce_ms=int(watcher_raw.get("debounce_ms", 200)),
@@ -628,6 +655,12 @@ def _validate(cfg: ServiceConfig) -> None:
         )
     # 0.0 disables the floor; 1.0 would suppress everything (cosines are
     # bounded in [-1, 1] but in practice in [0, 1]). >1 is nonsensical.
+    for proj, floor in cfg.index.project_floors.items():
+        if not (0.0 <= floor <= 1.0):
+            raise ConfigError(
+                f"[index].project_floors[{proj!r}] must be in "
+                f"[0.0, 1.0], got {floor}"
+            )
     if not (0.0 <= cfg.index.relevance_floor <= 1.0):
         raise ConfigError(
             f"[index].relevance_floor must be in [0.0, 1.0], got "

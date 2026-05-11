@@ -27,6 +27,37 @@ from typing import Optional
 from longctx_daemon import __version__
 
 
+def _load_searcher_config_from_user_config():
+    """Build a ``SearcherConfig`` populated from the user's config
+    file when present. Used by both ``longctx ask`` and ``longctx
+    serve`` so per-project floors set via ``longctx calibrate
+    --project NAME --write-config`` actually reach the searcher
+    without callers having to wire it up themselves.
+
+    Returns a ``SearcherConfig`` with ``relevance_floor`` and
+    ``project_floors`` reflecting the user's persisted choices.
+    Falls back silently to the defaults when the config file is
+    absent or unreadable — never blocks the search path on config
+    errors.
+    """
+    from longctx_daemon.searcher import SearcherConfig
+    try:
+        from longctx_daemon.config import (
+            config_path as _config_path,
+            load_config,
+        )
+        cfg_path = _config_path()
+        if not cfg_path.exists():
+            return SearcherConfig()
+        cfg = load_config(cfg_path)
+        return SearcherConfig(
+            relevance_floor=cfg.index.relevance_floor,
+            project_floors=dict(cfg.index.project_floors),
+        )
+    except Exception:  # noqa: BLE001 — config errors fall back to defaults
+        return SearcherConfig()
+
+
 # --------------------------------------------------------------- ask command
 
 def _cmd_ask(args: argparse.Namespace) -> int:
@@ -114,7 +145,7 @@ def _cmd_ask(args: argparse.Namespace) -> int:
         chunk_store=chunk_store,
         embed_store=embed_store,
         embedder=embedder,
-        config=SearcherConfig(),
+        config=_load_searcher_config_from_user_config(),
     )
     result = searcher.search(
         query=args.question,
@@ -308,7 +339,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
             chunk_store=chunk_store,
             embed_store=embed_store,
             embedder=embedder,
-            config=SearcherConfig(),
+            config=_load_searcher_config_from_user_config(),
         )
 
         replay_log = ReplayLog(cache_dir / "interactions.jsonl") \
@@ -465,6 +496,7 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
             config_path_override=(
                 Path(args.config).expanduser() if args.config else None
             ),
+            project=getattr(args, "project", None),
             verbose=args.verbose,
         )
     return 0
@@ -474,13 +506,21 @@ def _persist_floor_to_config(
     floor: float,
     *,
     config_path_override: Optional[Path],
+    project: Optional[str] = None,
     verbose: bool,
 ) -> int:
-    """Update ``[index].relevance_floor`` in the user's config file.
+    """Update either ``[index].relevance_floor`` (global) or
+    ``[index].project_floors[project]`` (per-project) in the user's
+    config file.
 
-    Loads the existing config (or default if missing), bumps the
-    field, validates, and writes back. Idempotent — running twice with
-    the same ``floor`` produces the same on-disk content. Returns the
+    When ``project`` is provided, the floor lands in the per-project
+    map — the searcher consults that map first when a search resolves
+    to a matching primary project, falling back to the global floor.
+    This is the Phase 3 dogfood-audit fix for "0.50 doesn't generalize
+    across corpus types."
+
+    Loads the existing config (or default if missing), updates the
+    field, validates, and writes back. Idempotent. Returns the
     standard exit code (0 ok, 2 invalid, 3 IO error).
     """
     from dataclasses import replace
@@ -504,7 +544,14 @@ def _persist_floor_to_config(
         print(f"error: failed to read config: {exc}", file=sys.stderr)
         return 2
 
-    new_index = replace(cfg.index, relevance_floor=float(floor))
+    if project:
+        # Per-project: merge into the existing project_floors map.
+        new_floors = dict(cfg.index.project_floors)
+        new_floors[project] = float(floor)
+        new_index = replace(cfg.index, project_floors=new_floors)
+    else:
+        # Global default.
+        new_index = replace(cfg.index, relevance_floor=float(floor))
     new_cfg = ServiceConfig(
         corpus=cfg.corpus, server=cfg.server, index=new_index,
         watcher=cfg.watcher, cleanup=cfg.cleanup, search=cfg.search,
@@ -516,7 +563,13 @@ def _persist_floor_to_config(
         print(f"error: failed to write config: {exc}", file=sys.stderr)
         return 3
 
-    print(f"updated {cfg_path}: [index].relevance_floor = {floor:.2f}")
+    if project:
+        print(
+            f"updated {cfg_path}: "
+            f"[index].project_floors[{project!r}] = {floor:.2f}"
+        )
+    else:
+        print(f"updated {cfg_path}: [index].relevance_floor = {floor:.2f}")
     if verbose:
         print(
             "  reload the daemon (`longctx reload`) to pick up the new "
@@ -1320,8 +1373,18 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Emit JSON instead of pretty-printed table.")
     cal.add_argument(
         "--write-config", action="store_true",
-        help="Persist the recommended floor to [index].relevance_floor "
-             "in the user's config file (default ~/.config/longctx/config.toml).",
+        help="Persist the recommended floor to the user's config file "
+             "(default ~/.config/longctx/config.toml). Without --project, "
+             "writes to [index].relevance_floor (global). With --project, "
+             "writes to [index].project_floors[NAME] (per-project, takes "
+             "precedence over global when scope resolves to that project).",
+    )
+    cal.add_argument(
+        "--project", default=None,
+        help="When set with --write-config, persist as a per-project "
+             "floor under [index].project_floors[NAME] instead of the "
+             "global [index].relevance_floor. Recommended for any non-"
+             "code corpus (mixed-content needs ~0.60, prose-heavy ~0.65).",
     )
     cal.add_argument(
         "--config",
