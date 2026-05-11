@@ -26,6 +26,9 @@ dependencies = [
     "sentence-transformers>=3.0",
     "faiss-cpu>=1.7.4",
     "rank-bm25>=0.2.2",
+    "loguru>=0.7",
+    "mcp>=1.0",
+    "pathspec>=0.12",
 ]
 
 [project.optional-dependencies]
@@ -46,6 +49,7 @@ dev = [
 longctx-eval = "longctx.eval.cli:main"
 longctx-bench = "longctx.eval.bench:main"
 longctx-coarse-bench = "longctx.eval.bench_coarse_filter:main"
+longctx = "longctx_daemon.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/TheTom/longctx"
@@ -53,7 +57,7 @@ Repository = "https://github.com/TheTom/longctx"
 Documentation = "https://github.com/TheTom/longctx#readme"
 
 [tool.setuptools.packages.find]
-include = ["longctx*"]
+include = ["longctx*", "longctx_daemon*"]
 
 [tool.pytest.ini_options]
 addopts = "--cov=longctx --cov-fail-under=90"
