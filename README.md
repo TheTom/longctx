@@ -9,9 +9,12 @@ repo, three entry points:
 - **CLI** — ``longctx ask`` against a directory, no infra required.
 - **Daemon + MCP** — long-lived service, exposes ``search_codebase`` to
   Claude Code / OpenCode / Hermes.
-- **Inference-side service** (``longctx-svc``) — drops in front of any
-  OpenAI-compatible engine (vllm-swift / llama.cpp / vLLM) and splices
-  retrieved chunks into the prompt automatically.
+- **Inference-side service** (``longctx-svc``) — drops in front of an
+  OpenAI-compatible engine and splices retrieved chunks into the prompt
+  automatically. **Primary target: [vllm-swift](https://github.com/TheTom/vllm-swift)
+  on Apple Silicon.** Upstream vLLM and llama.cpp work via the generic
+  proxy path; first-class ``--enable-longctx`` integration for them is
+  future work.
 
 It also doubles as the **rescue layer** for TriAttention V3 — KV-cache
 eviction without losing the evicted context, because longctx catches the
@@ -35,8 +38,9 @@ evicted spans, indexes them, and serves them back on the next turn.
                            │               │               ▼
                            │               │     ┌──────────────────────┐
                            │               │     │  inference engine    │
-                           │               │     │  (vllm-swift /       │
-                           │               │     │   llama.cpp / vLLM)  │
+                           │               │     │  vllm-swift  ◀ main  │
+                           │               │     │  vLLM / llama.cpp    │
+                           │               │     │   (via proxy mode)   │
                            │               │     └──────┬───────────────┘
                            │               │            │ --enable-longctx
                            │               │            ▼
@@ -74,9 +78,11 @@ Three retrieval shapes share the same library and storage layer:
 - ``longctx-svc`` is an **HTTP companion** for inference engines — it owns
   its own scope/index/watcher stack and the V3 evict-rehydrate endpoints,
   but pulls retrieval primitives from the same ``longctx.rag`` package.
-- The **inference engine** (vllm-swift, llama.cpp, vLLM forks) takes one
-  CLI flag and the rest is transparent: completions get a
-  ``## Retrieved code context`` block prepended at the system level.
+- The **inference engine** takes one CLI flag and the rest is transparent:
+  completions get a ``## Retrieved code context`` block prepended at the
+  system level. ``vllm-swift`` has first-class ``--enable-longctx`` wiring.
+  vLLM and llama.cpp work via the OpenAI proxy mode; native CLI-flag
+  integration for them is on the roadmap.
 
 ---
 
@@ -166,26 +172,48 @@ retrieved chunks into every chat completion. The model just sees a normal
 prompt with a ``## Retrieved code context`` system block at the top — no
 agent loop required.
 
-**Mode A — sidecar (`--enable-longctx`).** Engine auto-spawns the service:
+#### vllm-swift — primary target (Apple Silicon)
+
+[``vllm-swift``](https://github.com/TheTom/vllm-swift) has first-class
+``--enable-longctx`` wiring. The engine auto-spawns longctx-svc as a
+sidecar; the rest is transparent.
 
 ```bash
 vllm-swift serve ~/models/Qwen3-4B-4bit --enable-longctx
-# or
-vllm serve <model> --enable-longctx                          # TheTom/vllm-turboquant
-# or
-llama-server-longctx -m model.gguf --port 8000 --enable-longctx
 ```
 
-**Mode B — proxy.** Engine unchanged, longctx-svc sits in front and
-rewrites requests:
+510/510 vllm-swift tests still green with the flag wired. Flag absent =
+bit-for-bit unchanged engine behavior.
+
+#### vLLM / llama.cpp — proxy mode (any OpenAI-compatible engine)
+
+Native ``--enable-longctx`` integration for upstream vLLM and llama.cpp is
+**future work**. Until then, run longctx-svc as a transparent OpenAI proxy
+in front of the engine:
 
 ```bash
+# Engine on :8080 (unchanged)
 llama-server -m model.gguf --port 8080 &
+
+# longctx-svc proxy on :8765 — rewrites incoming requests, forwards to engine
 longctx-svc serve --upstream http://localhost:8080
+
+# Point your client at the proxy
 export OPENAI_BASE_URL=http://localhost:8765/v1
 ```
 
-Direct ``/retrieve`` for fine control:
+This works with any OpenAI-compatible server (upstream vLLM, upstream
+llama.cpp, ollama, LM Studio, anything) — the proxy doesn't care what's
+upstream. Tradeoff vs the sidecar path: one extra HTTP hop per request and
+no engine-side ergonomics (no ``--enable-longctx`` flag).
+
+A proper integration would push the splice into the engine's prompt-build
+path so the engine owns scope detection + retrieval lifecycle. Open issue
+welcomed — see ``services/longctx-svc/integration/`` for the vllm-swift
+reference.
+
+#### Fine-grained: hit ``/retrieve`` directly
+
 ```bash
 curl -s http://127.0.0.1:8080/retrieve -H 'content-type: application/json' \
   -d '{"prefill_text": "fix the JWT validation in src/auth/jwt.py",
@@ -193,13 +221,6 @@ curl -s http://127.0.0.1:8080/retrieve -H 'content-type: application/json' \
        "default_scope": "/path/to/repo",
        "top_k": 8}'
 ```
-
-Tested end-to-end with **TheTom/vllm-swift**, **TheTom/llama-cpp-turboquant**,
-**TheTom/vllm-turboquant** (MI300X), and upstream vLLM / llama.cpp.
-
-The tool is **optional everywhere**. Flag absent + env unset = bit-for-bit
-unchanged engine behavior. 510/510 vllm-swift tests still green after
-wiring.
 
 ### 4. TriAttention V3 rescue mode (advanced)
 
@@ -355,7 +376,9 @@ Full curves + receipts in [`docs/results.md`](docs/results.md),
 | §6.1 | Auto Hot→Package promotion when out-of-Hot path mentioned | ✅ v0.3.1 |
 | §6.2 | Confidence-driven promotion (top-K cosine across N turns) | ✅ v0.3.2 |
 | §6.3 | Workspace `ws:` mode (multi-scope query merge) | ✅ v0.3.3 |
-| §6.3 | Cross-engine parity (`--enable-longctx` on all 3 forks) | ✅ v0.3.3 |
+| §6.3 | First-class `--enable-longctx` wiring (vllm-swift) | ✅ v0.3.3 |
+| §6.3 | Generic OpenAI proxy mode (vLLM / llama.cpp / any compat) | ✅ v0.3.3 |
+| §6.3 | Native CLI-flag integration for vLLM / llama.cpp | 🛣️ future |
 | — | Symbol-aware retrieval (sym-grep + file-type prior) | ✅ |
 | — | Auto-policy router (context-size + query-shape adaptive) | ✅ |
 | — | Per-corpus relevance floor + ``longctx calibrate`` | ✅ |
@@ -400,6 +423,10 @@ longctx/
 ## What's next
 
 Out-of-scope for v0.3 (per PRD §11), tracked separately:
+- **First-class ``--enable-longctx`` integration for upstream vLLM and
+  llama.cpp** — pushes scope detection + retrieval into the engine's
+  prompt-build path so users get the same one-flag UX as vllm-swift.
+  Until then, proxy mode covers the gap.
 - Agentic loops with apply-edit
 - Tree-sitter for more languages (currently 5)
 - Multi-user / LAN deployments
