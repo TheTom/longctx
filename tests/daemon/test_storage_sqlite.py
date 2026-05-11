@@ -548,3 +548,41 @@ def test_list_chunk_ids_in_scope_project_in_filter(
         ])
     fan = store.list_chunk_ids_in_scope(ScopeFilter(project_in=("a", "c")))
     assert len(fan) == 2
+
+
+def test_rename_file_preserves_chunks_and_embeddings(
+    store: SqliteChunkStore, tmp_path: Path,
+) -> None:
+    """Watcher RENAME path: only the files.rel_path + mtime change;
+    chunks and their embedding_row references are untouched."""
+    store.upsert_project(Project(name="p", root_path=str(tmp_path / "p")))
+    fid = store.upsert_file(FileRecord(
+        id=0, project="p", rel_path="src/old.py", mtime=100, size_bytes=42,
+        content_hash="z" * 64,
+    ))
+    store.upsert_chunks([
+        Chunk(
+            id=0, file_id=fid, chunk_index=i, start_offset=i * 10,
+            end_offset=(i + 1) * 10, start_line=i, end_line=i + 1,
+            token_count=4, content_hash=f"{i:064x}", text=f"hello {i}",
+            embedder_model="m", embedder_sha256="s", embedding_row=i,
+        )
+        for i in range(3)
+    ])
+    pre_chunks = store.get_chunks_by_file(fid)
+    pre_rows = tuple(c.embedding_row for c in pre_chunks)
+    assert len(pre_chunks) == 3
+
+    store.rename_file(fid, new_rel_path="src/new.py", mtime=200)
+
+    rec = store.get_file_by_id(fid)
+    assert rec is not None
+    assert rec.rel_path == "src/new.py"
+    assert rec.mtime == 200
+
+    post_chunks = store.get_chunks_by_file(fid)
+    assert len(post_chunks) == 3
+    assert tuple(c.embedding_row for c in post_chunks) == pre_rows
+    # Hash unchanged (text didn't change)
+    assert {c.content_hash for c in pre_chunks} == \
+           {c.content_hash for c in post_chunks}

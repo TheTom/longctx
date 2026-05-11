@@ -62,7 +62,7 @@ class FakeIndexer:
 
 class FakeChunkStore:
     def __init__(self, projects=(), files_by_project=None, chunks_by_file=None):
-        self._projects = projects
+        self._projects = list(projects)
         self._files = files_by_project or {}
         self._chunks = chunks_by_file or {}
 
@@ -74,6 +74,41 @@ class FakeChunkStore:
 
     def get_chunks_by_file(self, file_id: int):
         return tuple(self._chunks.get(file_id, ()))
+
+    def get_project(self, name: str):
+        for p in self._projects:
+            if p.name == name:
+                return p
+        return None
+
+    def upsert_project(self, project) -> None:
+        for i, existing in enumerate(self._projects):
+            if existing.name == project.name:
+                self._projects[i] = project
+                return
+        self._projects.append(project)
+
+    def get_file(self, project: str, rel_path: str):
+        for rec in self._files.get(project, ()):
+            if rec.rel_path == rel_path:
+                return rec
+        return None
+
+    def get_file_by_id(self, file_id: int):
+        for files in self._files.values():
+            for rec in files:
+                if rec.id == file_id:
+                    return rec
+        return None
+
+    def get_chunks_by_id(self, ids):
+        ids_set = set(ids)
+        out = []
+        for chunks in self._chunks.values():
+            for c in chunks:
+                if c.id in ids_set:
+                    out.append(c)
+        return tuple(out)
 
 
 # ============================================================ builders
@@ -372,20 +407,49 @@ class TestIndexStatus:
         assert out["error"] == "disk full"
 
 
-# ============================================================ stubs
-class TestStubs:
-    @pytest.mark.parametrize("tool", [
-        "set_active_project", "add_project", "find_related",
-        "wait_for_quiescence",
-    ])
-    def test_returns_not_implemented(self, tool):
+# ============================================================ Phase 2.1 tools
+class TestPhase21Tools:
+    """Sanity smoke for the four Phase-2.1 tools that were stubs in 2.0.
+
+    The full behavioral coverage lives in
+    ``test_mcp_set_active_project.py``, ``test_mcp_add_project.py``,
+    ``test_mcp_find_related.py``, and ``test_mcp_wait_for_quiescence.py``.
+    Here we only check the dispatcher routes them away from the
+    not_implemented sentinel.
+    """
+
+    def test_set_active_project_no_longer_stub(self):
+        # Unknown project triggers the validation branch, but the
+        # response is the live error shape, not the 2.0 stub sentinel.
         server = _make_server()
-        # Each stub is invoked with a benign arg payload. _dispatch_tool
-        # ignores the schema (it would only be enforced through the SDK).
-        out = asyncio.run(server._dispatch_tool(tool, {}))
-        assert out["status"] == "not_implemented_in_2_0"
-        assert out["tool"] == tool
-        assert out["ships_in"] == "2.1"
+        out = asyncio.run(
+            server._dispatch_tool("set_active_project", {"project": "absent"})
+        )
+        assert "status" not in out or out.get("status") != "not_implemented_in_2_0"
+        assert "error" in out
+
+    def test_wait_for_quiescence_no_watcher_returns_quiescent(self):
+        server = _make_server()
+        out = asyncio.run(server._dispatch_tool("wait_for_quiescence", {}))
+        assert out["pending_updates"] == 0
+        assert "indexed_through" in out
+
+    def test_find_related_without_embed_store_errors(self):
+        server = _make_server()
+        out = asyncio.run(
+            server._dispatch_tool("find_related", {"file_path": "x/y.py"})
+        )
+        assert "error" in out
+
+    def test_add_project_rejects_nonexistent_path(self, tmp_path):
+        server = _make_server()
+        out = asyncio.run(
+            server._dispatch_tool(
+                "add_project",
+                {"path": str(tmp_path / "definitely-not-here")},
+            )
+        )
+        assert "error" in out
 
 
 # ============================================================ trace logging
@@ -579,7 +643,9 @@ class TestEndToEnd:
         client = mcp_lines[-1]["record"]["extra"]["client"]
         assert client == {"name": "opencode", "version": "0.4.2"}
 
-    def test_stub_tool_via_sdk(self):
+    def test_phase21_tool_via_sdk(self):
+        # set_active_project is now live — unknown project returns
+        # an explicit error response (not a 2.0 sentinel).
         async def _run():
             server = _make_server()
             async with _connected_session(server) as client:
@@ -590,7 +656,8 @@ class TestEndToEnd:
         resp = asyncio.run(_run())
         assert resp.isError is False
         sc = resp.structuredContent
-        assert sc["status"] == "not_implemented_in_2_0"
+        assert "error" in sc
+        assert sc["error"].startswith("unknown project")
 
     def test_search_with_input_validation(self):
         """Missing required ``query`` arg should be rejected by the SDK

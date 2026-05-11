@@ -550,6 +550,123 @@ class Indexer:
                     self._embed.free_row(chunk.embedding_row)
         self._store.delete_project(name)
 
+    def rename_file(
+        self,
+        project: str,
+        old_rel_path: str,
+        new_rel_path: str,
+    ) -> bool:
+        """Cheap rename: update the file's ``rel_path`` without re-embedding.
+
+        Phase 2.2 path used by the watcher when the debounce coalesces a
+        DELETE+CREATE on different basenames into a single RENAME (PRD
+        §5.4). The chunk text is unchanged, so we want to avoid a full
+        re-embed pass.
+
+        Returns ``True`` when the cheap path applied (file row updated
+        in place, embeddings preserved). Returns ``False`` when:
+
+          * The old record doesn't exist (already deleted / never indexed).
+          * The new path doesn't pass the filter chain (e.g. moved into
+            ``node_modules``) — we drop the old record cleanly.
+          * The backend doesn't support an in-place ``rename_file`` and
+            the fallback "delete + reindex" applied — embeddings are
+            lost in that path; logged at INFO so the operator sees it.
+
+        Note for storage backend authors: implementing
+        ``ChunkStore.rename_file(file_id, new_rel_path)`` makes this
+        path zero-cost (one SQL UPDATE). Without it we degrade to
+        delete + reindex which loses cached embeddings but still
+        preserves correctness.
+        """
+        proj = self._store.get_project(project)
+        if proj is None:
+            return False
+        existing = self._store.get_file(project, old_rel_path)
+        if existing is None:
+            return False
+        root = Path(proj.root_path)
+        new_abs = (root / new_rel_path).resolve()
+
+        # Filter the destination first — if the new path violates
+        # secret_patterns or exclude_patterns, we just drop the old row.
+        gitignore = _GitignoreMatcher(root)
+        if not should_index(new_abs, root, self._config, gitignore):
+            self.delete_file(project, old_rel_path)
+            return False
+
+        # Cheap path: backend exposes a rename hook.
+        backend_rename = getattr(self._store, "rename_file", None)
+        if callable(backend_rename):
+            try:
+                # Stat the new path so the file row's mtime stays honest.
+                try:
+                    mtime = int(new_abs.stat().st_mtime)
+                except OSError:
+                    mtime = existing.mtime
+                backend_rename(existing.id, new_rel_path, mtime=mtime)
+                return True
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "backend rename_file failed for %s/%s -> %s; "
+                    "falling back to delete+reindex",
+                    project, old_rel_path, new_rel_path,
+                )
+
+        # Fallback: drop the old record, reindex under the new path.
+        # _index_file's content-hash diff still reuses chunk text but the
+        # embedding rows are gone (delete_file freed them above). Logged
+        # so operators can spot when they should add the backend hook.
+        logger.info(
+            "rename_file falling back to delete+reindex for %s/%s -> %s "
+            "(backend has no rename_file hook)",
+            project, old_rel_path, new_rel_path,
+        )
+        self.delete_file(project, old_rel_path)
+        if new_abs.is_file():
+            self._index_file(project, root, new_abs)
+        return False
+
+    def update_files(
+        self, project: str, abs_paths: Iterable[Path],
+    ) -> UpdateResult:
+        """Bulk variant of ``update_file`` — used by the watcher worker.
+
+        Today this just iterates ``update_file`` and aggregates the
+        counts; the upgrade lever is to share one ``encode`` call across
+        all files in the batch (PRD §5.3 promises ~20 chunks across 20
+        files = one batched embed). That optimization is left for Phase
+        2.3 once the indexer's chunk-diff has been refactored to expose
+        a "queue these chunks" entry point separate from the per-file
+        commit.
+
+        Aggregate ``wall_secs`` is the sum of per-file wall times — not
+        a wall-clock measurement of the bulk pass — so the existing
+        per-call trace shape stays intact.
+        """
+        n_files = 0
+        n_total = 0
+        n_new = 0
+        n_reused = 0
+        n_skipped = 0
+        wall = 0.0
+        for path in abs_paths:
+            res = self.update_file(project, path)
+            n_files += res.n_files
+            n_total += res.n_chunks_total
+            n_new += res.n_chunks_new
+            n_reused += res.n_chunks_reused
+            n_skipped += res.n_files_skipped
+            wall += res.wall_secs
+        return UpdateResult(
+            n_files=n_files,
+            n_chunks_total=n_total,
+            n_chunks_new=n_new,
+            n_chunks_reused=n_reused,
+            n_files_skipped=n_skipped,
+            wall_secs=wall,
+        )
+
     # ----------------------------------------------------- internals
 
     def _walk(self, root: Path) -> Iterable[Path]:

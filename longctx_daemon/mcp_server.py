@@ -1,12 +1,9 @@
-"""MCP server (stdio transport) for the longctx daemon — Phase 2.0.
+"""MCP server (stdio + SSE transports) for the longctx daemon.
 
-Phase 2.0 ships ONLY the stdio transport. SSE / streamable-http land in
-2.1 (PRD §6.1).
-
-Tools live: search_codebase, list_projects, index_status.
-Tools registered as not-yet-implemented stubs so the spec surface is
-visible to MCP clients but obviously inactive:
-  set_active_project, add_project, find_related, wait_for_quiescence
+Phase 2.0 shipped stdio + the four "live" tools (search_codebase,
+list_projects, index_status). Phase 2.1 makes the four spec-stubs real:
+``set_active_project``, ``add_project``, ``find_related``, and
+``wait_for_quiescence`` — see PRD §3.4, §3.8, §6.2, §6.4.
 
 Each tool invocation:
   1. Generates a fresh trace_id (ULID).
@@ -22,20 +19,29 @@ The class takes a duck-typed ``searcher``, ``indexer`` and
 ``chunk_store``: in tests we pass mocks; in production the daemon
 wires them up. The contract is:
   * searcher.search(query, *, cwd, project, max_tokens, max_results,
-    wait_for_quiescence_ms) -> SearchResult
+    wait_for_quiescence_ms, active_project_sticky) -> SearchResult
+  * indexer.add_project(name, root_path) -> Project
+  * indexer.full_scan(project) -> ScanResult
   * indexer.status() -> IndexStatus
+  * indexer.config: IndexerConfig (for the forbidden_dirs check)
   * chunk_store.list_projects() -> tuple[Project, ...]
   * chunk_store.list_files(project=name) -> tuple[FileRecord, ...]
-  * chunk_store.get_chunks_by_file(file_id) -> tuple[Chunk, ...] (used
-    only to compute the per-project token_count when we don't already
-    have a cheaper way).
+  * chunk_store.get_chunks_by_file(file_id) -> tuple[Chunk, ...]
+  * chunk_store.upsert_project(Project) -> None  (used to set/clear
+    session_id on session-bound projects)
+  * embed_store.get(row) / embed_store.search_dense(...)  (find_related)
+  * watcher.wait_for_quiescence(project, timeout_ms) -> (pending, iso)
+    (optional; daemon mode wires it, stdio passes None)
 """
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict, is_dataclass
+from contextvars import ContextVar
+from dataclasses import asdict, dataclass, field, is_dataclass, replace
+from datetime import datetime, timezone
+from pathlib import Path
 from time import perf_counter
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
@@ -100,9 +106,7 @@ _FIND_RELATED_DOC = (
     "follow imports, or resolve symbol references. Static-analysis-aware\n"
     "variants (callers_of, callees_of, references_to) are planned for\n"
     "Phase 3+ and will be separate tools so the agent never has to guess\n"
-    "which kind of \"related\" it asked for.\n"
-    "\n"
-    "(ships in 2.1)"
+    "which kind of \"related\" it asked for."
 )
 
 _LIST_PROJECTS_DOC = (
@@ -112,24 +116,18 @@ _LIST_PROJECTS_DOC = (
 
 _SET_ACTIVE_PROJECT_DOC = (
     "Set the sticky active project for this MCP session. Subsequent\n"
-    "search_codebase calls without cwd or project args use this scope.\n"
-    "\n"
-    "(ships in 2.1)"
+    "search_codebase calls without cwd or project args use this scope."
 )
 
 _ADD_PROJECT_DOC = (
     "Index a new directory. persist=True writes to config (survives\n"
-    "daemon restart); persist=False indexes for this session only.\n"
-    "\n"
-    "(ships in 2.1)"
+    "daemon restart); persist=False indexes for this session only."
 )
 
 _WAIT_FOR_QUIESCENCE_DOC = (
     "Block until the index has no pending updates for the given project\n"
     "(or all projects). Returns when queue is empty or timeout fires.\n"
-    "Useful between 'I just wrote N files' and 'now search for them'.\n"
-    "\n"
-    "(ships in 2.1)"
+    "Useful between 'I just wrote N files' and 'now search for them'."
 )
 
 _INDEX_STATUS_DOC = (
@@ -203,8 +201,82 @@ _WAIT_FOR_QUIESCENCE_SCHEMA: dict[str, Any] = {
 }
 
 
-# Sentinel for not-yet-implemented stubs.
+# Sentinel for not-yet-implemented stubs (kept for backwards compat
+# with any external code that still inspects the marker).
 _STUB_RESPONSE: dict[str, Any] = {"status": "not_implemented_in_2_0"}
+
+
+def _now_iso() -> str:
+    """ISO-8601 UTC timestamp with a trailing ``Z`` (per spec §6.3)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _source_chunk_summary(project: str, rel_path: str, chunk) -> dict[str, Any]:
+    """Compact identifier for the find_related source chunk."""
+    return {
+        "project": project,
+        "file_path": f"{project}/{rel_path}",
+        "start_line": chunk.start_line,
+        "end_line": chunk.end_line,
+    }
+
+
+# ====================================================== ConnectionContext
+@dataclass
+class ConnectionContext:
+    """Per-connection state for an MCP session.
+
+    Phase 2.0 only had a single connection per process (stdio). 2.1's
+    SSE + streamable-http multiplex many sessions through one daemon, so
+    each session gets its own context with:
+
+    * ``session_id`` — stable for the life of the SSE/HTTP session;
+      surfaced in the §14.4 trace log so multi-session noise is
+      separable in a tail.
+    * ``connection_id`` — the same value the existing trace context
+      uses; a new connection = a new ID.
+    * ``cwd_history`` — last N cwd values seen via ``search_codebase``.
+      Used by the scope inference layer (Agent G/H wire-up).
+    * ``active_project_sticky`` — set via ``set_active_project``;
+      used as the fallback scope when no cwd is provided. Not persisted
+      across daemon restarts.
+
+    Transports build a fresh context per accepted connection and stash
+    it in ``_active_context_var`` for the duration of any
+    ``_dispatch_tool`` call so the dispatcher sees the right state.
+    """
+    session_id: str
+    connection_id: str
+    cwd_history: list[str] = field(default_factory=list)
+    active_project_sticky: Optional[str] = None
+    client_name: str = "unknown"
+    client_version: str = "unknown"
+
+
+# Per-task active connection. Transports set this in their accept-loop
+# before invoking the SDK; the dispatcher reads it under any active
+# request. Falls back to MCPServer's default connection_id when None.
+_active_context_var: ContextVar[Optional[ConnectionContext]] = ContextVar(
+    "longctx_active_connection", default=None,
+)
+
+
+def set_active_connection(ctx: Optional[ConnectionContext]) -> Any:
+    """Set the active ``ConnectionContext`` for the current task.
+
+    Returns the contextvar token so the caller can ``reset`` later.
+    """
+    return _active_context_var.set(ctx)
+
+
+def get_active_connection() -> Optional[ConnectionContext]:
+    """Return the active connection context, or None outside one."""
+    return _active_context_var.get()
+
+
+def reset_active_connection(token: Any) -> None:
+    """Reset the contextvar via the token returned by ``set_active_connection``."""
+    _active_context_var.reset(token)
 
 
 # ============================================================ MCPServer
@@ -221,24 +293,81 @@ class MCPServer:
         indexer: Any,
         chunk_store: Any,
         *,
+        embed_store: Any = None,
+        watcher: Any = None,
+        config_path: Optional[Path] = None,
+        background_runner: Optional[Callable[[Callable[[], Any]], Any]] = None,
         server_name: str = "longctx",
         server_version: str = "0.2.0",
         replay_log: Optional[ReplayLog] = None,
         connection_id: Optional[str] = None,
     ) -> None:
+        """Wire up the server.
+
+        Args:
+            searcher / indexer / chunk_store: required core services.
+            embed_store: optional EmbedStore. Required only by
+                ``find_related`` — passing ``None`` means find_related
+                returns an error response.
+            watcher: optional watcher exposing
+                ``async wait_for_quiescence(project, timeout_ms)``.
+                When ``None`` the wait_for_quiescence tool returns
+                "no watcher attached, queue is empty" semantics.
+            config_path: optional path to the daemon config TOML.
+                ``add_project(persist=True)`` appends a project entry.
+                Phase 2.1 adds best-effort write; Agent E owns the
+                full schema.
+            background_runner: callable that schedules a function in
+                the daemon's worker pool. Used to kick off the
+                ``add_project`` full_scan without blocking the MCP
+                response. Defaults to ``asyncio.to_thread`` via the
+                running loop.
+            replay_log: optional ReplayLog for full-payload tracing.
+            connection_id: stdio path's connection identity. Ignored
+                when SSE/streamable-http transports set a fresh
+                ``ConnectionContext`` per accept.
+        """
         self.searcher = searcher
         self.indexer = indexer
         self.chunk_store = chunk_store
+        self.embed_store = embed_store
+        self._watcher = watcher
+        self._config_path = config_path
+        self._background_runner = background_runner
         self.server_name = server_name
         self.server_version = server_version
         self.replay_log = replay_log
         # One MCPServer instance corresponds to one stdio MCP connection,
         # so the connection_id is set at construction. For SSE / streamable
-        # this'll move to per-connection state in 2.1.
+        # transports, per-connection state lives in ``ConnectionContext``
+        # set via ``set_active_connection`` in the transport's accept loop.
         self.connection_id = connection_id or new_trace_id()
+        # Stdio fallback session state. Used when no ConnectionContext
+        # is active (i.e. unit tests + the stdio transport which has
+        # exactly one session per process).
+        self._fallback_context = ConnectionContext(
+            session_id=f"ses_{self.connection_id[:12]}",
+            connection_id=self.connection_id,
+        )
 
         self._server: Server = Server(server_name, version=server_version)
         self._register_handlers()
+
+    # ---------------------------------------------------------- accessors
+    @property
+    def server(self) -> Server:
+        """Underlying low-level ``mcp.server.lowlevel.Server`` instance.
+
+        Exposed so transports (SSE / streamable-http) can call
+        ``server.run(read, write, init_options)`` without poking at the
+        private ``_server`` attribute. The dispatcher and tool handlers
+        are already registered.
+        """
+        return self._server
+
+    def initialization_options(self):
+        """Convenience proxy to the SDK's create_initialization_options."""
+        return self._server.create_initialization_options()
 
     # ----------------------------------------------------- public entrypoint
     async def run_stdio(self) -> None:
@@ -314,15 +443,25 @@ class MCPServer:
         We separate this from the @call_tool handler so tests can call
         it directly without driving the whole MCP transport.
         """
-        # Capture clientInfo from the active session, if available.
-        client_name, client_version = self._extract_client_info()
+        # Per-connection context (set by SSE/streamable-http transports)
+        # takes precedence over instance-level state. Stdio transport
+        # doesn't set one, so we fall back to ``self.connection_id``.
+        active_ctx = get_active_connection()
+        if active_ctx is not None:
+            connection_id = active_ctx.connection_id
+            session_id = active_ctx.session_id
+            client_name = active_ctx.client_name
+            client_version = active_ctx.client_version
+        else:
+            client_name, client_version = self._extract_client_info()
+            connection_id = self.connection_id
+            session_id = self._extract_session_id()
 
         trace_id = new_trace_id()
-        session_id = self._extract_session_id()
         set_trace_context(
             trace_id=trace_id,
             session_id=session_id,
-            connection_id=self.connection_id,
+            connection_id=connection_id,
             client_name=client_name,
             client_version=client_version,
         )
@@ -352,7 +491,7 @@ class MCPServer:
                     {
                         "trace_id": trace_id,
                         "session_id": session_id,
-                        "connection_id": self.connection_id,
+                        "connection_id": connection_id,
                         "client": {"name": client_name, "version": client_version},
                         "tool": name,
                         "args": arguments,
@@ -370,7 +509,7 @@ class MCPServer:
                     {
                         "trace_id": trace_id,
                         "session_id": session_id,
-                        "connection_id": self.connection_id,
+                        "connection_id": connection_id,
                         "client": {"name": client_name, "version": client_version},
                         "tool": name,
                         "args": arguments,
@@ -387,11 +526,25 @@ class MCPServer:
             "search_codebase": self._handle_search_codebase,
             "list_projects": self._handle_list_projects,
             "index_status": self._handle_index_status,
-            "find_related": self._handle_stub("find_related"),
-            "set_active_project": self._handle_stub("set_active_project"),
-            "add_project": self._handle_stub("add_project"),
-            "wait_for_quiescence": self._handle_stub("wait_for_quiescence"),
+            "find_related": self._handle_find_related,
+            "set_active_project": self._handle_set_active_project,
+            "add_project": self._handle_add_project,
+            "wait_for_quiescence": self._handle_wait_for_quiescence,
         }.get(name)
+
+    # -------------------------------------------------- session-state helper
+    def _session_state(self) -> ConnectionContext:
+        """Return the active per-connection state.
+
+        Phase 2.1 transports (SSE / streamable-http) push a fresh
+        ``ConnectionContext`` via ``set_active_connection`` for each
+        accepted session. Stdio + tests fall back to
+        ``self._fallback_context`` so the API surface is uniform.
+        """
+        active = get_active_connection()
+        if active is not None:
+            return active
+        return self._fallback_context
 
     # ============================================================ live tools
     async def _handle_search_codebase(
@@ -405,15 +558,32 @@ class MCPServer:
         max_results = args.get("max_results")
         wait_ms = args.get("wait_for_quiescence_ms")
 
-        # The searcher may be sync or async; await accordingly.
-        result = self.searcher.search(
-            query=query,
-            cwd=cwd,
-            project=project,
-            max_tokens=max_tokens,
-            max_results=max_results,
-            wait_for_quiescence_ms=wait_ms,
-        )
+        # Sticky session: when caller didn't pass project= or cwd, use
+        # the session's set_active_project value (PRD §3.4 / §3.9). The
+        # searcher's scope-decision tier 3 (active_project_sticky) does
+        # the actual routing — we just thread the value through.
+        sticky = self._session_state().active_project_sticky
+
+        # The searcher may be sync or async; await accordingly. We pass
+        # ``active_project_sticky`` only when the searcher's signature
+        # accepts it — duck-type-friendly for the FakeSearcher tests
+        # already in tests/daemon/test_mcp_server.py.
+        kwargs: dict[str, Any] = {
+            "query": query,
+            "cwd": cwd,
+            "project": project,
+            "max_tokens": max_tokens,
+            "max_results": max_results,
+            "wait_for_quiescence_ms": wait_ms,
+        }
+        if sticky is not None:
+            kwargs["active_project_sticky"] = sticky
+        try:
+            result = self.searcher.search(**kwargs)
+        except TypeError:
+            # Older fakes don't take active_project_sticky — drop it.
+            kwargs.pop("active_project_sticky", None)
+            result = self.searcher.search(**kwargs)
         if asyncio.iscoroutine(result):
             result = await result
 
@@ -522,18 +692,435 @@ class MCPServer:
         }
         return flat, None, {"total": elapsed}, summary
 
-    # ============================================================ stubs
-    def _handle_stub(self, tool_name: str):
-        """Build a stub coroutine that records the spec surface but
-        returns ``not_implemented_in_2_0`` cleanly."""
+    # ============================================================ Phase 2.1 tools
 
-        async def _stub(args: dict[str, Any]):
-            response = dict(_STUB_RESPONSE)
-            response["tool"] = tool_name
-            response["ships_in"] = "2.1"
-            return response, None, {"total": 0.0}, response
+    async def _handle_set_active_project(
+        self, args: dict[str, Any],
+    ) -> tuple[dict[str, Any], Optional[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+        """PRD §3.4 — pin a project for the current MCP session.
 
-        return _stub
+        Subsequent ``search_codebase`` calls without ``cwd`` / ``project``
+        use this scope. State lives on the per-connection
+        ``ConnectionContext`` so three terminals = three independent
+        contexts; connection drops drop the state.
+        """
+        t0 = perf_counter()
+        project = args["project"]
+        # Validate the project exists. We list everything indexed so the
+        # error response can include the available names — tiny hint that
+        # saves an extra round-trip in the agent.
+        proj_obj = self.chunk_store.get_project(project)
+        if proj_obj is None:
+            available = [p.name for p in self.chunk_store.list_projects()]
+            response = {
+                "error": f"unknown project: {project}",
+                "available_projects": available,
+            }
+            elapsed = (perf_counter() - t0) * 1000.0
+            return response, None, {"total": elapsed}, response
+
+        # Update session-scoped state.
+        self._session_state().active_project_sticky = project
+        elapsed = (perf_counter() - t0) * 1000.0
+        response = {"status": "ok", "active_project": project}
+        return response, None, {"total": elapsed}, response
+
+    async def _handle_add_project(
+        self, args: dict[str, Any],
+    ) -> tuple[dict[str, Any], Optional[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+        """PRD §3.8 — runtime project addition.
+
+        - Resolves ``path`` (~ expansion + absolute).
+        - Verifies it exists + is a directory.
+        - Refuses if basename matches ``forbidden_dirs``.
+        - Refuses if a project with the same name (basename) is already
+          indexed (returns informative error with the existing root).
+        - ``persist=True`` writes a config entry; ``persist=False``
+          binds the project to the current session via ``session_id``.
+        - Kicks off a background ``full_scan`` and returns immediately
+          with ``{"status": "indexing"}``. Caller polls
+          ``wait_for_quiescence`` (or ``index_status``) to know when
+          it's ready.
+        """
+        t0 = perf_counter()
+        raw_path = args["path"]
+        persist = bool(args.get("persist", False))
+
+        try:
+            abs_path = Path(raw_path).expanduser().resolve()
+        except (OSError, RuntimeError) as exc:
+            response = {"error": f"invalid path: {raw_path} ({exc})"}
+            elapsed = (perf_counter() - t0) * 1000.0
+            return response, None, {"total": elapsed}, response
+
+        if not abs_path.exists():
+            response = {"error": f"path does not exist: {abs_path}"}
+            elapsed = (perf_counter() - t0) * 1000.0
+            return response, None, {"total": elapsed}, response
+        if not abs_path.is_dir():
+            response = {"error": f"path is not a directory: {abs_path}"}
+            elapsed = (perf_counter() - t0) * 1000.0
+            return response, None, {"total": elapsed}, response
+
+        # Forbidden-dirs check. The indexer enforces this too via
+        # ``ForbiddenProjectError`` at add_project time, but we surface
+        # the error as a clean response rather than letting it bubble
+        # into the per-call trace as an unhandled exception. We pull
+        # the set off the indexer's config so behavior stays in sync.
+        forbidden = self._forbidden_dirs()
+        if abs_path.name in forbidden:
+            response = {
+                "error": (
+                    f"refusing to index forbidden_dirs root: {abs_path.name}"
+                ),
+                "forbidden_dirs": sorted(forbidden),
+            }
+            elapsed = (perf_counter() - t0) * 1000.0
+            return response, None, {"total": elapsed}, response
+
+        # Already indexed?
+        name = abs_path.name
+        existing = self.chunk_store.get_project(name)
+        if existing is not None:
+            response = {
+                "error": "project already indexed",
+                "name": name,
+                "root_path": existing.root_path,
+                "session_bound": existing.session_id is not None,
+            }
+            elapsed = (perf_counter() - t0) * 1000.0
+            return response, None, {"total": elapsed}, response
+
+        # Run the indexer's add_project (raises ForbiddenProjectError
+        # for nested-forbidden roots; we already filtered the basename).
+        try:
+            project_obj = self.indexer.add_project(name=name, root_path=abs_path)
+        except Exception as exc:
+            response = {"error": f"indexer.add_project failed: {exc}"}
+            elapsed = (perf_counter() - t0) * 1000.0
+            return response, None, {"total": elapsed}, response
+
+        # If non-persistent, stamp the project row with the session_id
+        # so the GC-on-disconnect path can pick it up. If persistent,
+        # ensure session_id is None and (best-effort) write the config.
+        session_id = self._session_state().session_id
+        if not persist:
+            self.chunk_store.upsert_project(
+                replace(project_obj, session_id=session_id),
+            )
+        else:
+            # Make sure session_id is cleared on persist.
+            if project_obj.session_id is not None:
+                self.chunk_store.upsert_project(
+                    replace(project_obj, session_id=None),
+                )
+            self._persist_project_to_config(name, str(abs_path))
+
+        # Kick off the full_scan asynchronously — return immediately
+        # with status=indexing. Agent calls wait_for_quiescence to
+        # know when it's done.
+        self._launch_full_scan(name)
+
+        response = {
+            "status": "indexing",
+            "project": name,
+            "root_path": str(abs_path),
+            "persist": persist,
+        }
+        if not persist:
+            response["session_id"] = session_id
+        elapsed = (perf_counter() - t0) * 1000.0
+        summary = {"project": name, "persist": persist}
+        return response, None, {"total": elapsed}, summary
+
+    async def _handle_find_related(
+        self, args: dict[str, Any],
+    ) -> tuple[dict[str, Any], Optional[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+        """PRD §6.2 (revised) — semantic similarity only.
+
+        - Locate the chunk containing ``file_path``:``line``. With
+          ``line=None`` the first chunk of the file wins; otherwise
+          the chunk whose [start_line, end_line] interval contains
+          ``line`` (falls back to the first chunk if no chunk covers
+          the line — which happens when the file has been re-chunked
+          after the agent's last view).
+        - Embedding lookup via ``embed_store.get(chunk.embedding_row)``.
+        - Brute-force ``embed_store.search_dense`` over all chunks
+          excluding the source chunk's own ID.
+        - Returns top-K with the same shape as ``search_codebase``.
+
+        ``file_path`` accepts either ``project/rel/path.py`` (the form
+        ``search_codebase`` returns) or the bare ``rel/path.py``. The
+        former is preferred — the bare form requires walking
+        ``list_files`` across all projects.
+        """
+        t0 = perf_counter()
+        file_path = args["file_path"]
+        line = args.get("line")
+        max_results = int(args.get("max_results", 5))
+
+        if self.embed_store is None:
+            response = {
+                "error": "find_related unavailable: no embed_store wired",
+            }
+            elapsed = (perf_counter() - t0) * 1000.0
+            return response, None, {"total": elapsed}, response
+
+        located = self._locate_file_record(file_path)
+        if located is None:
+            response = {"error": "file not indexed", "file_path": file_path}
+            elapsed = (perf_counter() - t0) * 1000.0
+            return response, None, {"total": elapsed}, response
+        file_rec, _matched_form = located
+
+        chunks = self.chunk_store.get_chunks_by_file(file_rec.id)
+        if not chunks:
+            response = {
+                "error": "file has no indexed chunks",
+                "file_path": file_path,
+            }
+            elapsed = (perf_counter() - t0) * 1000.0
+            return response, None, {"total": elapsed}, response
+
+        source_chunk = self._pick_chunk_for_line(chunks, line)
+        if source_chunk.embedding_row is None:
+            response = {
+                "error": "source chunk has no embedding",
+                "file_path": file_path,
+            }
+            elapsed = (perf_counter() - t0) * 1000.0
+            return response, None, {"total": elapsed}, response
+
+        # Pull the source embedding and run dense search.
+        query_emb = self.embed_store.get(source_chunk.embedding_row)
+        # search_dense doesn't have a "exclude these chunk_ids" param,
+        # so we ask for K+1 then filter the source chunk out client-side.
+        hits = self.embed_store.search_dense(
+            query_emb,
+            max_results + 1,
+            None,
+        )
+        kept_ids: list[int] = []
+        kept_scores: dict[int, float] = {}
+        for hit in hits:
+            if hit.chunk_id == source_chunk.id:
+                continue
+            kept_ids.append(hit.chunk_id)
+            kept_scores[hit.chunk_id] = float(hit.score)
+            if len(kept_ids) >= max_results:
+                break
+
+        if not kept_ids:
+            response = {
+                "chunks": [],
+                "source": _source_chunk_summary(
+                    file_rec.project, file_rec.rel_path, source_chunk,
+                ),
+            }
+            elapsed = (perf_counter() - t0) * 1000.0
+            return response, None, {"total": elapsed}, response
+
+        chunks_by_id = {
+            c.id: c for c in self.chunk_store.get_chunks_by_id(kept_ids)
+        }
+        # Materialize chunks in score order (the Hit list is already
+        # ranked).
+        out_chunks: list[dict[str, Any]] = []
+        for cid in kept_ids:
+            chunk = chunks_by_id.get(cid)
+            if chunk is None:
+                # Chunk vanished between search_dense and get_chunks_by_id
+                # (race with an indexer write). Skip rather than blow up.
+                continue
+            file_for_chunk = self.chunk_store.get_file_by_id(chunk.file_id)
+            if file_for_chunk is None:
+                continue
+            out_chunks.append({
+                "project": file_for_chunk.project,
+                "file_path": f"{file_for_chunk.project}/{file_for_chunk.rel_path}",
+                "start_line": chunk.start_line,
+                "end_line": chunk.end_line,
+                "text": chunk.text,
+                "relevance_score": kept_scores[cid],
+            })
+
+        response = {
+            "chunks": out_chunks,
+            "source": _source_chunk_summary(
+                file_rec.project, file_rec.rel_path, source_chunk,
+            ),
+        }
+        elapsed = (perf_counter() - t0) * 1000.0
+        summary = {
+            "chunk_count": len(out_chunks),
+            "files": [
+                f"{c['file_path']}:{c['start_line']}-{c['end_line']}"
+                for c in out_chunks
+            ],
+        }
+        return response, None, {"total": elapsed}, summary
+
+    async def _handle_wait_for_quiescence(
+        self, args: dict[str, Any],
+    ) -> tuple[dict[str, Any], Optional[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+        """PRD §6.4 — block on the watcher queue until drained or
+        ``timeout_ms`` elapses.
+
+        With no watcher attached (stdio path / unit tests), returns the
+        always-quiescent response immediately. Daemon mode wires the
+        real watcher (Agent G) and we just await its callback.
+        """
+        t0 = perf_counter()
+        project = args.get("project")
+        timeout_ms = int(args.get("timeout_ms", 2000))
+
+        if self._watcher is None:
+            response = {
+                "pending_updates": 0,
+                "indexed_through": _now_iso(),
+            }
+            elapsed = (perf_counter() - t0) * 1000.0
+            return response, None, {"total": elapsed}, response
+
+        try:
+            pending, indexed_through = await self._watcher.wait_for_quiescence(
+                project, timeout_ms,
+            )
+        except Exception as exc:
+            response = {
+                "error": f"watcher.wait_for_quiescence failed: {exc}",
+                "pending_updates": -1,
+                "indexed_through": _now_iso(),
+            }
+            elapsed = (perf_counter() - t0) * 1000.0
+            return response, None, {"total": elapsed}, response
+
+        response = {
+            "pending_updates": int(pending),
+            "indexed_through": indexed_through,
+        }
+        elapsed = (perf_counter() - t0) * 1000.0
+        return response, None, {"total": elapsed}, response
+
+    # ----------------------------------------------- helpers for live tools
+
+    def _forbidden_dirs(self) -> frozenset[str]:
+        """Pull ``forbidden_dirs`` off the indexer's config when present.
+
+        Test fakes don't always have a ``config`` attribute; we fall
+        back to the sensible default set so misuse on test paths is
+        still rejected.
+        """
+        cfg = getattr(self.indexer, "config", None)
+        if cfg is not None and hasattr(cfg, "forbidden_dirs"):
+            return frozenset(cfg.forbidden_dirs)
+        # Last-resort default mirrors indexer.DEFAULT_FORBIDDEN_DIRS.
+        return frozenset({"secrets", "credentials", ".aws", ".ssh", ".gnupg"})
+
+    def _launch_full_scan(self, project: str) -> None:
+        """Schedule an indexer.full_scan in the background.
+
+        The daemon (Agent F) will plumb a worker pool via
+        ``background_runner``; in test paths we synthesize the call
+        with ``asyncio.create_task`` if a running loop is available,
+        otherwise we run it inline (synchronous) and swallow exceptions
+        — the indexer's own logging is the user-visible audit trail.
+        """
+        runner = self._background_runner
+
+        def _scan() -> Any:
+            try:
+                return self.indexer.full_scan(project)
+            except Exception:  # pragma: no cover — logged inside indexer
+                # Don't propagate: the scan happens AFTER the response
+                # is already on the wire.
+                return None
+
+        if runner is not None:
+            try:
+                runner(_scan)
+                return
+            except Exception:  # pragma: no cover
+                pass
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # No loop — fall back to inline (test path with a manual
+            # event loop). We've already returned the response shape,
+            # so a slow inline scan only delays the dispatch_tool's
+            # post-handler bookkeeping; acceptable for tests.
+            _scan()
+            return
+        loop.create_task(asyncio.to_thread(_scan))
+
+    def _persist_project_to_config(self, name: str, root_path: str) -> None:
+        """Best-effort append of a ``[[projects]]`` block to the daemon
+        config TOML.
+
+        Phase 2.1 — Agent E owns the canonical schema. We append to a
+        well-known marker section so the live add survives restart;
+        when Agent E ships the structured writer, this naive append
+        will get folded in.
+        """
+        path = self._config_path
+        if path is None:
+            return
+        path = Path(path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            block = (
+                "\n# added at runtime via add_project(persist=True)\n"
+                "[[projects]]\n"
+                f'name = "{name}"\n'
+                f'root_path = "{root_path}"\n'
+            )
+            with path.open("a", encoding="utf-8") as f:
+                f.write(block)
+        except OSError:  # pragma: no cover — best-effort
+            return
+
+    def _locate_file_record(self, file_path: str):
+        """Resolve ``file_path`` to a ``FileRecord``.
+
+        Acceptable inputs:
+          * ``"projectname/rel/path.py"`` — the canonical form
+            (matches what ``search_codebase`` returns in citations)
+          * ``"rel/path.py"`` — bare relative form; we walk every
+            project's files looking for a unique match.
+
+        Returns ``(FileRecord, matched_form)`` or ``None``.
+        """
+        # Canonical form first.
+        if "/" in file_path:
+            head, tail = file_path.split("/", 1)
+            rec = self.chunk_store.get_file(head, tail)
+            if rec is not None:
+                return rec, "project/rel"
+        # Bare-rel-path fallback. Match across all projects; if more
+        # than one project has the same rel_path we pick the first
+        # (deterministic by project name order).
+        for proj in self.chunk_store.list_projects():
+            rec = self.chunk_store.get_file(proj.name, file_path)
+            if rec is not None:
+                return rec, "rel-only"
+        return None
+
+    def _pick_chunk_for_line(self, chunks, line: Optional[int]):
+        """Return the chunk whose [start_line, end_line] covers ``line``.
+
+        ``line=None`` selects the first chunk in chunk_index order.
+        Falls back to the first chunk if no chunk covers the requested
+        line (which happens when the file has been re-chunked since
+        the agent last saw it).
+        """
+        ordered = sorted(chunks, key=lambda c: c.chunk_index)
+        if line is None:
+            return ordered[0]
+        for c in ordered:
+            if c.start_line <= line <= c.end_line:
+                return c
+        return ordered[0]
 
     # ============================================================ helpers
     def _extract_client_info(self) -> tuple[str, str]:
@@ -606,4 +1193,10 @@ def _jsonify(v: Any) -> Any:
     return v
 
 
-__all__ = ["MCPServer"]
+__all__ = [
+    "ConnectionContext",
+    "MCPServer",
+    "get_active_connection",
+    "reset_active_connection",
+    "set_active_connection",
+]

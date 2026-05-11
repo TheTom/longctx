@@ -407,6 +407,18 @@ class SqliteChunkStore:
             self._conn.execute("DELETE FROM files WHERE id = ?", (file_id,))
         self._bm25_dirty = True
 
+    def rename_file(
+        self, file_id: int, new_rel_path: str, *, mtime: int,
+    ) -> None:
+        """Cheap rename: chunks + embeddings preserved, only files
+        row mutates. The watcher's RENAME path uses this so bulk
+        ``git mv`` operations don't trigger re-embedding."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE files SET rel_path = ?, mtime = ? WHERE id = ?",
+                (new_rel_path, mtime, file_id),
+            )
+
     def get_file_by_id(self, file_id: int) -> Optional[FileRecord]:
         """Lookup by primary key. Used by the searcher when materializing
         citations from chunk hits — chunks know their file_id but the

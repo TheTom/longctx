@@ -65,6 +65,15 @@ class ChunkStore(Protocol):
         """Cascades to chunks; frees their embedding rows via EmbedStore."""
         ...
 
+    def rename_file(
+        self, file_id: int, new_rel_path: str, *, mtime: int,
+    ) -> None:
+        """Cheap rename: update files.rel_path + files.mtime in-place.
+        Chunks + embeddings preserved (text didn't change). Used by
+        the watcher's RENAME path so a `git mv` of 50 files doesn't
+        re-embed any of them."""
+        ...
+
     # ----------------------------------------------------------- chunk crud
 
     def upsert_chunks(self, chunks: Iterable[Chunk]) -> None:

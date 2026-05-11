@@ -27,15 +27,15 @@ from longctx_daemon.types import (
 
 # ---------------------------------------------------------------- parser
 
-def test_build_parser_has_three_commands():
+def test_build_parser_has_phase_2_0_commands():
+    """Ensure the Phase 2.0 commands stayed registered after 2.1 added
+    the daemon-aware subcommands."""
     parser = cli.build_parser()
-    # argparse stores subparsers internally; trigger a help call to
-    # confirm parse-without-error and inspect the choices list.
     actions = [a for a in parser._actions if hasattr(a, "choices")
                and a.choices is not None]
     assert actions, "parser should have a subparser action"
     sub_choices = set(actions[0].choices)
-    assert sub_choices == {"ask", "serve", "version"}
+    assert {"ask", "serve", "version"}.issubset(sub_choices)
 
 
 def test_version_command(capsys):
