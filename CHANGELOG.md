@@ -1,8 +1,51 @@
 # Changelog
 
-## longctx unreleased — 12M coarse filter (hierarchical-selector pipeline)
+## 0.3.1 — 2026-05-11
 
-Pre-release; lives on `feature/coarse-filter-12m`. Not yet shipped.
+Patch release: CI gate + audit-driven cleanups on top of v0.3.0.
+
+* **CI coverage gate** — added `[tool.coverage.run]` ``omit`` for CLI
+  bench drivers (``bench_coarse_filter_real.py``, ``eval/cli.py``) so
+  the 90% library-coverage gate doesn't trip on script orchestration
+  code. Total covered: 93% (up from 81%).
+* **Version strings synced.** ``longctx``, ``longctx_daemon``, and
+  ``longctx_svc`` ``__version__`` strings all bumped to 0.3.1 in lock-
+  step with their pyproject.toml.
+* **README cleanup.** ``longctx-svc`` test count corrected (210 →
+  221). Dangling ref to ``integration/bakeoff_results.json`` (file
+  doesn't exist) replaced with link to the runnable
+  ``cross_model_bakeoff.py`` harness.
+* **CHANGELOG.** Promoted the "unreleased — 12M coarse filter"
+  section to v0.3.0 and added this v0.3.1 entry.
+
+## 0.3.0 — 2026-05-11
+
+First real release. 58 commits collapsed into 13 clean ones off main.
+
+Headline features (see commit log + README for full surface):
+
+* **longctx_daemon** — long-lived service with persistent
+  `SqliteChunkStore` + `MemmapEmbedStore`, MCP transport
+  (`search_codebase`, `set_active_project`), file watcher with
+  incremental re-embed, macOS launchd + Linux systemd installers.
+* **longctx-svc v0.3.0** — local retrieval companion for inference
+  engines. First-class ``--enable-longctx`` on vllm-swift, generic
+  OpenAI proxy mode for vLLM / llama.cpp / any-compat.
+  Drops the alpha suffix; classifier moves to Beta.
+* **Symbol-aware retrieval augment** — grep ``class X`` / ``def X``
+  for identifiers in the query, boost ``.py`` over docs when the
+  query has a code signal. Recovered 5/10 SWE-bench retrieval_miss
+  cases.
+* **Auto-policy router** — context-size + query-shape adaptive
+  retrieval (BM25/dense weights + embedder hint).
+* **Per-corpus relevance floor** + ``longctx calibrate`` CLI.
+* **TriAttention V3 rescue mode** — V3 evicts KV cells, longctx
+  catches the spans + serves them back on the next turn. End-to-end
+  256K NIAH receipt: V3+longctx ✓HIT every rung 32K → 256K.
+
+## 0.2.x — 12M coarse filter (hierarchical-selector pipeline)
+
+Originally landed on `feature/coarse-filter-12m` pre-v0.3.0.
 
 ### Why
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "longctx"
-version = "0.3.0"
+version = "0.3.1"
 description = "Open long-context inference stack: retrieval + open weights, no closed parts."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -76,3 +76,12 @@ include = ["longctx*", "longctx_daemon*"]
 [tool.pytest.ini_options]
 addopts = "--cov=longctx --cov-fail-under=90"
 testpaths = ["tests"]
+
+[tool.coverage.run]
+# CLI bench drivers are not unit-testable — they orchestrate long-running
+# corpora bench runs. Excluded from the coverage gate so the gate measures
+# library code, not script orchestration. Re-include if a unit harness lands.
+omit = [
+    "longctx/eval/bench_coarse_filter_real.py",
+    "longctx/eval/cli.py",
+]

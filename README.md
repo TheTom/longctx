@@ -1,7 +1,7 @@
 # longctx
 
-> **v0.3.0 — first real release.** APIs are stable for v0.3.x; numbers and
-> framing may still tighten. Issues + PRs welcome. Apache-2.0.
+> **v0.3.1.** APIs are stable for v0.3.x; numbers and framing may still
+> tighten. Issues + PRs welcome. Apache-2.0.
 
 **Open long-context retrieval for evaluations and live coding sessions.** One
 repo, three entry points:
@@ -303,7 +303,7 @@ job. Cross-model bake-off:
 - **Qwen2.5-32B-Instruct** (verified on MI300X) — solid baseline.
 - DeepSeek-Coder-V2 / Codestral 22B / Qwen2.5-Coder 32B for code-heavy work.
 
-Full bake-off: [`integration/bakeoff_results.json`](services/longctx-svc/integration/bakeoff_results.json).
+Full bake-off harness: [`integration/cross_model_bakeoff.py`](services/longctx-svc/integration/cross_model_bakeoff.py).
 
 ---
 
@@ -343,7 +343,7 @@ llama.cpp, vllm-swift, the obsidian vault, plus longctx itself —
 - Cache reload from disk: 8.9 s
 
 **Test coverage:**
-- ``longctx-svc``: **210 tests, all green** — scope detection, walk +
+- ``longctx-svc``: **221 tests, all green** — scope detection, walk +
   .gitignore, chunker (line + tree-sitter), indexer, session manager,
   async kickoff, idle eviction, disk cache, file watcher, OpenAI-compat
   proxy, sidecar spawn + port-collision, V3 evict/rehydrate roundtrip.
