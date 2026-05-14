@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.3.2 — 2026-05-13
+
+Patch release. No API changes; coverage + test hardening only.
+
+* **Coverage gates green.** `longctx` 81% → 97%; `longctx-svc` 62% →
+  87%. Adds `[tool.coverage.run]` `omit` for CLI bench entrypoints
+  (`bench_coarse_filter*.py`) and the tree-sitter optional path so
+  gates measure library code, not script orchestration. New 85%
+  fail-under gate on `longctx-svc`'s `pyproject.toml`.
+
+* **+80 new unit tests across both packages:**
+  - `longctx`: 5 branch tests on `symbol_augment` (dotted-symbol
+    decomposition, ripgrep error-swallow, neutral-weight fallback).
+  - `longctx-svc/client.py` (77% → 100%): env construction,
+    `healthz`, sync + async `retrieve` error degradation, splice
+    helper, full payload parsing.
+  - `longctx-svc/proxy.py` (73% → 92%): message helpers, dump,
+    503-disabled guards, `/v1/models` passthrough.
+  - `longctx-svc/eviction_store.py` (77% → 90%): BM25 tokenize edge
+    cases, env_float parsing, `rank_bm25` ImportError fallback,
+    empty corpus guard, reranker lazy-load cache.
+  - `longctx-svc/state.py` (81% → 87%): pipeline lazy init,
+    `evict_idle` skip branches, watcher attach/detach edge cases,
+    `maybe_promote` early returns, `reset_state` cleanup.
+
+* Total: longctx 1172 → 1177 passing tests; longctx-svc 216 → 291.
+
 ## 0.3.1 — 2026-05-11
 
 Patch release: CI gate + audit-driven cleanups on top of v0.3.0.
