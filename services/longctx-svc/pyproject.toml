@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "longctx-svc"
-version = "0.3.1"
+version = "0.3.2"
 description = "Local retrieval companion for inference servers — scoped, session-aware, file-watching."
 readme = "README.md"
 requires-python = ">=3.11"

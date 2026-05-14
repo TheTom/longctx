@@ -11,7 +11,7 @@ Reference: see https://github.com/TheTom/longctx for benchmarks and
 reproductions of the open-stack-matches-SubQ result.
 """
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 from longctx.rag.pipeline import RetrievalPipeline
 from longctx.rag.client import LongCtxClient
