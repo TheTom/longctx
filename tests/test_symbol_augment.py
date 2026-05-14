@@ -202,3 +202,76 @@ def test_weight_doc_demote_under_signal():
 def test_weight_test_files_slightly_demoted():
     qf = {"n_tracebacks": 1, "n_symbol_defs": 0, "n_error_types": 0}
     assert file_type_weight("pkg/tests/test_thing.scala", qf) == 0.9
+
+
+# Coverage gap: file_type_weight fallback when no extension family
+# matches AND query has code signal — neutral 1.0 weight.
+def test_weight_unknown_extension_neutral_under_signal():
+    qf = {"n_tracebacks": 1, "n_symbol_defs": 0, "n_error_types": 0}
+    # Binary-like extension not in code/doc/test buckets → neutral.
+    assert file_type_weight("data/blob.parquet", qf) == 1.0
+
+
+# Coverage gap: dotted-symbol decomposition keeps the parts long
+# enough to clear the 4-char floor and drops the original.
+def test_extract_decomposes_long_dotted_symbol():
+    """A.B → drop A.B, keep A and B individually when each >= 4 chars.
+
+    Verifies the split-and-readd branch in extract_symbols (lines 67-72).
+    """
+    syms = extract_symbols("ClassOne.MethodAlpha raises ValueError")
+    assert "ClassOne" in syms
+    assert "MethodAlpha" in syms
+    # Original dotted form gone after decomposition.
+    assert "ClassOne.MethodAlpha" not in syms
+
+
+def test_extract_drops_short_part_of_dotted_symbol():
+    """A.b where part is < 4 chars: that part is dropped, the long part
+    survives. Confirms the `if len(p) >= 4` filter inside the split."""
+    syms = extract_symbols("LongClassName.ab raises")
+    assert "LongClassName" in syms
+    # "ab" (< 4 chars) must NOT survive.
+    assert "ab" not in syms
+
+
+# Coverage gap: ripgrep call paths that exit non-zero / raise.
+
+
+def test_grep_handles_ripgrep_exception(tmp_path, monkeypatch):
+    """If `subprocess.run` raises (rg missing, timeout, etc.) for a
+    symbol, that symbol contributes zero hits and we keep going.
+    Covers the `except Exception: continue` swallow at line 103-104.
+    """
+    import subprocess as _subprocess
+
+    real_run = _subprocess.run
+    call_count = {"n": 0}
+
+    def flaky_run(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise _subprocess.TimeoutExpired(cmd="rg", timeout=8)
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(_subprocess, "run", flaky_run)
+
+    # Two symbols — first run() raises, second succeeds (returns nothing
+    # in an empty tmp dir, but exercising the swallow + recovery path).
+    hits = symbol_grep_repo(["AlphaName", "BetaName"], tmp_path)
+    assert hits == []  # nothing found, but no exception bubbled up
+
+
+def test_grep_dedupes_repeated_lines(tmp_path):
+    """If the same line appears for two different symbols, it's only
+    emitted once. Covers `if not line or line in seen: continue`
+    at line 108-109."""
+    if shutil.which("rg") is None:
+        pytest.skip("ripgrep not installed")
+    # Single file mentioning two symbols → ripgrep returns the same line
+    # for both queries when symbols co-occur on a line.
+    (tmp_path / "src.py").write_text("AlphaName and BetaName are siblings\n")
+    hits = symbol_grep_repo(["AlphaName", "BetaName"], tmp_path)
+    # Both should NOT add separate entries for the same matched line.
+    unique = set(hits)
+    assert len(hits) == len(unique), f"duplicate lines in hits: {hits}"

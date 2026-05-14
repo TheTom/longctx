@@ -78,10 +78,19 @@ addopts = "--cov=longctx --cov-fail-under=90"
 testpaths = ["tests"]
 
 [tool.coverage.run]
+source = ["longctx"]
 # CLI bench drivers are not unit-testable — they orchestrate long-running
 # corpora bench runs. Excluded from the coverage gate so the gate measures
-# library code, not script orchestration. Re-include if a unit harness lands.
+# library code, not script orchestration.
 omit = [
+    "longctx/eval/bench_coarse_filter.py",
     "longctx/eval/bench_coarse_filter_real.py",
     "longctx/eval/cli.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
 ]
