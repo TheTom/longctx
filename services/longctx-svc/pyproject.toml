@@ -51,3 +51,24 @@ Documentation = "https://github.com/TheTom/longctx#readme"
 
 [tool.setuptools.packages.find]
 include = ["longctx_svc*"]
+
+[tool.pytest.ini_options]
+addopts = "--cov=longctx_svc --cov-fail-under=85"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["longctx_svc"]
+omit = [
+    # CLI entrypoint — argparse glue, no library API.
+    "longctx_svc/cli.py",
+    # Optional tree-sitter dep — gated module, exercised only when the
+    # package is installed. Unit-testing the import-fail path is low-value.
+    "longctx_svc/indexer/treesitter_chunker.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]
