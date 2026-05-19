@@ -1,0 +1,7 @@
+#!/bin/bash
+# Wrapper for MCP clients that don't forward env vars cleanly (Claude Code et al).
+# Exports PYTHONPATH so `python3 -m longctx_daemon.cli mcp-stdio` resolves the
+# package from this repo without requiring a global install.
+set -e
+export PYTHONPATH="/Users/tom/dev/longctx-cleanup"
+exec /opt/homebrew/bin/python3 -m longctx_daemon.cli mcp-stdio "$@"
