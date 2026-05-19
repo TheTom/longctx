@@ -61,139 +61,434 @@ from longctx_daemon.types import (
 
 
 # ----------------------------------------------------------- tool docstrings
-# Spec §6.4 — copy verbatim, don't paraphrase. Agents read these.
+# Tool descriptions follow Anthropic's tool-design guidance
+# (https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools
+#  and anthropic.com/engineering/writing-tools-for-agents):
+#
+#   * Detailed: each tool's description teaches *purpose*, *when to use*,
+#     *when NOT to use*, *parameters*, *return shape*, and *how to act
+#     on the response*. Not a paraphrase of the function signature.
+#   * Trigger-language: "Use this when …" / "Do not use this for …"
+#     make tool selection unambiguous during the agent's planning step.
+#   * Action-oriented response notes: tell the agent what to DO with
+#     each response field instead of just naming them.
+#   * Cross-tool linking: where the right next step is another tool,
+#     name it explicitly so the agent doesn't have to guess.
+#   * Agent-agnostic: no Claude-specific assumptions. Same description
+#     should be readable by Claude / Hermes / Codex / Pi / OpenCode /
+#     any future MCP client.
+#
+# These descriptions are the API contract — agents READ them during
+# planning. Do not shorten without rerunning the iterative-retrieval
+# audit (see project_iterative_retrieval_api memory).
 
 _SEARCH_CODEBASE_DOC = (
-    "Search the indexed codebase for code, comments, or documentation\n"
-    "relevant to the query. Returns top-matching chunks with file paths,\n"
-    "line numbers, and relevance scores.\n"
+    "Search an indexed local codebase for code, comments, or documentation\n"
+    "relevant to a natural-language query. Returns ranked text chunks with\n"
+    "file paths, line ranges, and per-chunk semantic-match scores. Each\n"
+    "chunk is a self-contained slice (typically 100-300 lines) — read it\n"
+    "before deciding whether to fetch the surrounding file with Read.\n"
     "\n"
-    "Args:\n"
-    "    query: Natural language description of what to find. A question,\n"
-    "        a code-pattern description, a feature name, or an identifier.\n"
-    "    cwd: Optional path the agent is currently working in. Used to bias\n"
-    "        results toward the active project. If None, falls back to the\n"
-    "        session's sticky active project (set via set_active_project).\n"
-    "    project: Optional project name to restrict search to. Available\n"
-    "        projects can be enumerated via list_projects.\n"
-    "    max_tokens: Cap the total token count of returned chunks. Default\n"
-    "        4096. Agents with smaller context windows pass less.\n"
-    "    max_results: Optional cap on chunk count. Use max_tokens preferentially;\n"
-    "        this is a fallback for callers that prefer count-based limits.\n"
-    "    wait_for_quiescence_ms: Block up to N ms waiting for in-flight index\n"
-    "        updates to drain before searching. Default 500. Pass 0 for\n"
-    "        zero-wait; pass 2000 if the agent just wrote many files.\n"
-    "    prior_context: Optional text (string or list of strings) capturing\n"
-    "        what you already know about the problem — prior error traces,\n"
-    "        previous query phrasings, observations from earlier turns.\n"
-    "        Mixed into the query embedding so the next round drifts\n"
-    "        toward what you've learned. AutoCodeRover-style retry pattern.\n"
-    "    prior_context_weight: How heavily to mix prior_context into the\n"
-    "        query. 0.0 = ignore prior; 0.3 = light bias (default); 0.5+\n"
-    "        = strong bias toward prior direction.\n"
-    "    suppress_ids: List of chunk_id ints already shown to the agent\n"
-    "        (read from prior response chunks). Filtered out so the next\n"
-    "        round returns DIFFERENT chunks. Use this to surface new\n"
-    "        evidence after a first round didn't help.\n"
+    "USE THIS WHEN:\n"
+    "  * You need to find code in a project that is too large to read\n"
+    "    whole files speculatively.\n"
+    "  * You don't know which file contains what you need.\n"
+    "  * You want to verify whether a symbol / pattern / concept exists\n"
+    "    before making claims about it (e.g. 'does function X exist?').\n"
+    "  * A compile error / failed test surfaces an unfamiliar trace —\n"
+    "    search with the error text as ``prior_context`` to bias\n"
+    "    retrieval toward error-shaped code (see ITERATIVE WORKFLOW).\n"
+    "  * The user asks 'where is X' or 'show me how Y works' — even if\n"
+    "    you think you know, search first; intuition lies on large repos.\n"
     "\n"
-    "Returns:\n"
-    "    SearchResponse with:\n"
-    "        chunks: list of {project, file_path, start_line, end_line,\n"
-    "                          text, relevance_score}\n"
-    "        stale_files: list of files whose mtime > last_indexed_at\n"
-    "        pending_updates: queue size at response time (0 = fully fresh)\n"
-    "        indexed_through: ISO timestamp of last completed index update\n"
+    "DO NOT USE THIS FOR:\n"
+    "  * Reading a file when you already know the exact path — use Read.\n"
+    "  * Verbatim string / regex match — this tool is semantic, not\n"
+    "    lexical. Use Grep when you need exact-token matches.\n"
+    "  * Git operations (commits, blame, history) — use the git CLI.\n"
+    "  * Listing files in a directory — use Glob.\n"
+    "  * Anything outside the indexed corpus (e.g. external docs) —\n"
+    "    nothing the index hasn't seen will appear here.\n"
+    "\n"
+    "ITERATIVE WORKFLOW (the most important pattern — most agents miss it):\n"
+    "  First call → read the chunks. If they don't fully answer:\n"
+    "  1. To see DIFFERENT chunks (NOT the ones you just read), call\n"
+    "     again with the SAME query and pass\n"
+    "         suppress_ids=[<chunk_id of each chunk you've already seen>]\n"
+    "     Read each chunk's ``chunk_id`` field off the prior response.\n"
+    "     This is cheaper and surfaces real alternatives — DO NOT just\n"
+    "     re-search with reshuffled keywords.\n"
+    "  2. If you now know more (an error trace, a partial fix, a\n"
+    "     refinement), pass that text as\n"
+    "         prior_context='<error trace or refined understanding>'\n"
+    "         prior_context_weight=0.3\n"
+    "     to bias the next retrieval toward what you've learned. This\n"
+    "     is the AutoCodeRover retry pattern; it works (validated on\n"
+    "     real SWE-bench traces).\n"
+    "  3. ``suppress_ids`` and ``prior_context`` compose — use both\n"
+    "     together when you want to drop seen chunks AND refine focus.\n"
+    "\n"
+    "RESPONSE FIELDS — what to DO with each:\n"
+    "  chunks: list of\n"
+    "      { chunk_id, project, file_path, start_line, end_line, text,\n"
+    "        relevance_score, dense_cosine }\n"
+    "    ``chunk_id`` is the round-trip key for ``suppress_ids`` on\n"
+    "      retry — preserve it in your working memory if you might\n"
+    "      iterate.\n"
+    "    ``relevance_score`` is rank-driven (RRF) — use for ordering\n"
+    "      only, NOT thresholding.\n"
+    "    ``dense_cosine`` is the absolute semantic-match score in\n"
+    "      [0, 1]. >0.75 = strong match; 0.60-0.74 = decent; <0.60 =\n"
+    "      weak — treat with skepticism.\n"
+    "  retrieval_quality: 'high' | 'medium' | 'low' | 'abstain' |\n"
+    "    'unknown'.\n"
+    "    * 'high' / 'medium' → safe to cite, but verify against the\n"
+    "      file before making code edits.\n"
+    "    * 'low' → do NOT cite as authoritative. Retry with\n"
+    "      ``prior_context`` refining the query, or tell the user.\n"
+    "    * 'abstain' → corpus had nothing meaningful. Don't fabricate.\n"
+    "  no_relevant_results: bool. When true, ``chunks`` is intentionally\n"
+    "    empty (top-1 score below the relevance floor). Tell the user\n"
+    "    that nothing matched — do not invent a result.\n"
+    "  top1_dense_cosine: best chunk's absolute semantic score.\n"
+    "  is_fully_fresh + stale_files: when ``is_fully_fresh=false``,\n"
+    "    chunks from listed ``stale_files`` may be out of date —\n"
+    "    warn the user OR call ``wait_for_quiescence`` first and retry.\n"
+    "  scope_decision: which project(s) the search hit and why\n"
+    "    (cwd / sticky / explicit / fanout). Surface this if results\n"
+    "    came from an unexpected project.\n"
+    "\n"
+    "WHAT THIS TOOL DOES NOT RETURN:\n"
+    "  * The raw whole file (chunks are line-range slices — use Read\n"
+    "    if you need surrounding context outside the returned range).\n"
+    "  * Callers / callees / symbol references (no static analysis).\n"
+    "  * Git history, blame, or diffs.\n"
+    "  * External documentation."
 )
 
 _FIND_RELATED_DOC = (
-    "Find chunks semantically similar to the chunk at file_path:line\n"
-    "(or to the whole file if line is None).\n"
+    "Find indexed chunks semantically similar to a known chunk\n"
+    "(specified by file_path + optional line) or to a whole file.\n"
+    "Returns the top-K nearest matches by dense embedding cosine\n"
+    "similarity.\n"
     "\n"
-    "Phase 2 implementation: dense embedding similarity only. The chunk at\n"
-    "file_path:line is embedded; the top-K nearest other chunks are\n"
-    "returned. Useful for \"show me similar implementations in other parts\n"
-    "of the codebase\" or \"what else looks like this\".\n"
+    "USE THIS WHEN:\n"
+    "  * You found one relevant chunk via search_codebase and want\n"
+    "    'more like this' across the codebase.\n"
+    "  * You want to see other places implementing the same pattern\n"
+    "    (e.g. 'find other places we handle pagination').\n"
+    "  * You're auditing for consistency ('show me everywhere we\n"
+    "    construct a database connection').\n"
+    "  * You have a specific code snippet and want to find analogues.\n"
     "\n"
-    "NOT a static-analysis tool — it does not parse callers/callees,\n"
-    "follow imports, or resolve symbol references. Static-analysis-aware\n"
-    "variants (callers_of, callees_of, references_to) are planned for\n"
-    "Phase 3+ and will be separate tools so the agent never has to guess\n"
-    "which kind of \"related\" it asked for."
+    "DO NOT USE THIS FOR:\n"
+    "  * Free-text 'what is X' queries — use search_codebase instead.\n"
+    "  * Finding all callers of a function — semantic similarity is\n"
+    "    not call-graph analysis. (Future tools: callers_of,\n"
+    "    callees_of, references_to.)\n"
+    "  * Finding all places that import a module — use Grep.\n"
+    "  * Anchoring on a chunk you haven't seen yet — call\n"
+    "    search_codebase or list_projects first to find a real anchor.\n"
+    "\n"
+    "PARAMETERS:\n"
+    "  file_path: Repo-relative path of the anchor file. The\n"
+    "    '<project>/<rel_path>' form returned by search_codebase\n"
+    "    works directly.\n"
+    "  line: Optional 1-indexed line number inside file_path.\n"
+    "    Specify when you want similarity to ONE function / section\n"
+    "    in the file. Omit to find files like this whole file.\n"
+    "  max_results: Default 5. Higher = more recall, more noise.\n"
+    "\n"
+    "RETURNS: Same chunk shape as search_codebase, ranked by\n"
+    "descending ``dense_cosine``. Includes a ``source_chunk`` dict\n"
+    "identifying the anchor used (for transparency about what the\n"
+    "tool actually compared against).\n"
+    "\n"
+    "NOT A STATIC-ANALYSIS TOOL: does not parse callers/callees,\n"
+    "follow imports, or resolve symbol references. Embedding\n"
+    "similarity only."
 )
 
 _LIST_PROJECTS_DOC = (
-    "List all projects currently indexed, with stats:\n"
-    "name, root_path, file_count, chunk_count, token_count, last_updated."
+    "Enumerate every codebase / corpus this longctx daemon currently\n"
+    "indexes, with per-project file count, chunk count, total token\n"
+    "count, and last-indexed timestamp. Cheap, instant, no side effects.\n"
+    "\n"
+    "USE THIS WHEN:\n"
+    "  * First MCP call of a session, before any search — confirm the\n"
+    "    daemon actually indexes the project you care about.\n"
+    "  * search_codebase returned an unexpected project and you want\n"
+    "    to see the full set.\n"
+    "  * The user asks 'what codebases is longctx watching' or 'is\n"
+    "    repo X indexed'.\n"
+    "  * Before calling set_active_project — verify the name exists.\n"
+    "\n"
+    "DO NOT USE THIS FOR:\n"
+    "  * Searching inside a project — use search_codebase.\n"
+    "  * Adding a new project — use add_project.\n"
+    "  * Repeated polling — the result rarely changes; call once\n"
+    "    per session at most.\n"
+    "\n"
+    "RETURNS: { projects: [{ name, root_path, file_count, chunk_count,\n"
+    "                        token_count, last_updated }] }.\n"
+    "``last_updated`` is a Unix timestamp (seconds since epoch).\n"
+    "\n"
+    "FOLLOW-UP: if there are multiple projects and the user is clearly\n"
+    "working in one, either pass ``project=<name>`` on each\n"
+    "search_codebase call or set_active_project once at session start\n"
+    "so subsequent searches default to that scope."
 )
 
 _SET_ACTIVE_PROJECT_DOC = (
-    "Set the sticky active project for this MCP session. Subsequent\n"
-    "search_codebase calls without cwd or project args use this scope."
+    "Pin a project name as the sticky scope for this MCP session.\n"
+    "Subsequent search_codebase calls that omit ``cwd`` and ``project``\n"
+    "default to this project's scope. Pure session state — resets when\n"
+    "the MCP session ends, not persisted across daemon restarts.\n"
+    "\n"
+    "USE THIS WHEN:\n"
+    "  * The user is working in one project for the session and you\n"
+    "    want every search to default to that scope without repeating\n"
+    "    ``project=<name>`` on every call.\n"
+    "  * You just called list_projects, saw the relevant project, and\n"
+    "    want to commit to it for the rest of the session.\n"
+    "\n"
+    "DO NOT USE THIS FOR:\n"
+    "  * One-off cross-project searches — pass ``project=`` on the\n"
+    "    individual call instead.\n"
+    "  * Adding a new project — use add_project FIRST, then this.\n"
+    "  * Persisting beyond a session — restart-survival requires daemon\n"
+    "    config, not this tool.\n"
+    "\n"
+    "PARAMETERS:\n"
+    "  project: Project name. Case-sensitive. Must already exist in\n"
+    "    list_projects output.\n"
+    "\n"
+    "RETURNS: Confirmation dict { project, set: true }. Errors with a\n"
+    "structured message if the name isn't indexed."
 )
 
 _ADD_PROJECT_DOC = (
-    "Index a new directory. persist=True writes to config (survives\n"
-    "daemon restart); persist=False indexes for this session only."
+    "Index a new directory as an additional project served by this\n"
+    "daemon. Walks the directory, chunks every text file, embeds each\n"
+    "chunk, and registers a new Project entry that's then searchable\n"
+    "via search_codebase. Synchronous within this call.\n"
+    "\n"
+    "USE THIS WHEN:\n"
+    "  * The user references a codebase that list_projects didn't show.\n"
+    "  * You need to search a directory the daemon wasn't started with.\n"
+    "\n"
+    "DO NOT USE THIS FOR:\n"
+    "  * Adding individual files — this is project-level only.\n"
+    "  * Re-indexing an existing project after edits — the filesystem\n"
+    "    watcher handles incremental updates automatically.\n"
+    "  * Switching scope to an already-indexed project — use\n"
+    "    set_active_project instead.\n"
+    "\n"
+    "PARAMETERS:\n"
+    "  path: Absolute filesystem path to the directory to index.\n"
+    "    Must exist and be readable.\n"
+    "  persist: When true, the project is saved to daemon config and\n"
+    "    survives daemon restarts. When false (default), it lives only\n"
+    "    for the current daemon process — agents typically pass false.\n"
+    "\n"
+    "RETURNS: { project_name, file_count, chunk_count, token_count }\n"
+    "after indexing completes. Initial indexing may take seconds to\n"
+    "minutes depending on corpus size; warn the user about the wait\n"
+    "for large directories (~10K+ files)."
 )
 
 _WAIT_FOR_QUIESCENCE_DOC = (
-    "Block until the index has no pending updates for the given project\n"
-    "(or all projects). Returns when queue is empty or timeout fires.\n"
-    "Useful between 'I just wrote N files' and 'now search for them'."
+    "Block until the index has zero pending file-update events for a\n"
+    "given project (or all projects when no name is given), or until\n"
+    "the timeout fires. Synchronization primitive between a write\n"
+    "burst and a search that depends on the new content.\n"
+    "\n"
+    "USE THIS WHEN:\n"
+    "  * You (or the user via you) just wrote N files and want the\n"
+    "    next search to see them — call with ``timeout_ms=2000-5000``\n"
+    "    so the watcher has time to re-embed.\n"
+    "  * A previous search_codebase returned ``is_fully_fresh=false``\n"
+    "    and you want to wait for staleness to clear before retrying.\n"
+    "\n"
+    "DO NOT USE THIS FOR:\n"
+    "  * Every search call — most searches don't need this and the\n"
+    "    wait adds latency. Call only after writing files.\n"
+    "  * Indefinite blocking — always set a finite ``timeout_ms``.\n"
+    "  * Pre-empting the watcher — it runs continuously; this only\n"
+    "    waits for it to catch up.\n"
+    "\n"
+    "PARAMETERS:\n"
+    "  project: Optional project name to wait on. When omitted, waits\n"
+    "    for ALL projects to drain.\n"
+    "  timeout_ms: Maximum block duration in milliseconds. Default 2000.\n"
+    "\n"
+    "RETURNS: { ok, indexed_through, pending } where ``ok=true`` means\n"
+    "the queue drained within the timeout and ``ok=false`` means it\n"
+    "didn't (``pending`` is the queue size at timeout expiry)."
 )
 
 _INDEX_STATUS_DOC = (
-    "Current daemon state: status, total_chunks, pending_updates,\n"
-    "embedder_model + sha256, last_full_scan, per-project stats."
+    "Report current daemon health: status string, total chunk count\n"
+    "across all projects, pending file-update queue size, embedder\n"
+    "model name and SHA, last full-scan timestamp, and per-project\n"
+    "statistics. Diagnostic tool — agents rarely need this in normal\n"
+    "operation.\n"
+    "\n"
+    "USE THIS WHEN:\n"
+    "  * The user asks 'is longctx working?' or 'is the index up to\n"
+    "    date?'.\n"
+    "  * You see unexpectedly empty search results and want to verify\n"
+    "    the daemon is healthy (not just that the corpus is empty).\n"
+    "  * You want to confirm which embedder model is in use before\n"
+    "    relying on cross-corpus retrieval.\n"
+    "\n"
+    "DO NOT USE THIS FOR:\n"
+    "  * Per-project file count — use list_projects (same per-project\n"
+    "    stats without the daemon-level fields).\n"
+    "  * Real-time polling — call once when needed; the daemon state\n"
+    "    doesn't change rapidly.\n"
+    "\n"
+    "RETURNS: { status, total_chunks, pending_updates, embedder_model,\n"
+    "embedder_sha256, last_full_scan, projects: [...] }."
 )
 
 
 # --------------------------------------------------------- input schemas
+# Every parameter has a ``description`` per Anthropic's tool-design
+# guidance (https://platform.claude.com/docs/en/agents-and-tools/
+# tool-use/define-tools). The per-arg descriptions are NOT redundant
+# with the tool's top-level doc — they're the agent's reference
+# during arg selection.
+
 _SEARCH_CODEBASE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        # Phase 2.0.1: query accepts string OR array. When array, each
-        # element runs independently and the response shape becomes
-        # {"groups": [{"query": ..., "chunks": [...]}, ...]} so the
-        # caller knows which chunks came from which sub-question.
         "query": {
             "oneOf": [
                 {"type": "string"},
                 {"type": "array", "items": {"type": "string"}, "minItems": 1},
             ],
+            "description": (
+                "Natural-language description of what to find. A question, "
+                "a code-pattern description, a feature name, an identifier, "
+                "or an error message. May also be an ARRAY of strings — "
+                "each runs independently and the response shape becomes "
+                "``{ groups: [{ query, chunks, ... }, ...] }`` so the "
+                "caller knows which chunks came from which sub-query. Use "
+                "the array form when you have multiple distinct questions; "
+                "use the single-string form (with prior_context / "
+                "suppress_ids on retry) for one focused question."
+            ),
         },
-        "cwd": {"type": ["string", "null"]},
-        "project": {"type": ["string", "null"]},
-        "max_tokens": {"type": "integer", "default": 4096},
-        "max_results": {"type": ["integer", "null"]},
-        "wait_for_quiescence_ms": {"type": ["integer", "null"]},
-        # Phase 2.0.1: per-call override of the dense-cosine
-        # relevance floor. Top-1 cosine below this returns empty
-        # chunks + no_relevant_results=True. 0 disables.
-        "relevance_floor": {"type": ["number", "null"]},
-        # Phase 3: opt into context-size + query-shape adaptive
-        # routing. When True, the searcher detects query shape +
-        # estimates corpus size, looks up the policy table, and
-        # overrides retrieval weights for THIS call. Surfaces
-        # rationale + embedder hint on the response.
-        "auto_policy": {"type": "boolean", "default": False},
-        # 2026-05-19: iterative retrieval (AutoCodeRover-style retry).
-        # prior_context mixes prior text/observations into the query
-        # embedding; suppress_ids drops chunks the agent has already
-        # been shown. See SearcherConfig docs + commit bb88867.
+        "cwd": {
+            "type": ["string", "null"],
+            "description": (
+                "Absolute path the agent is currently working in. Used to "
+                "auto-scope results to the matching project. Pass when "
+                "you know the user's cwd; omit when starting an "
+                "unscoped search."
+            ),
+        },
+        "project": {
+            "type": ["string", "null"],
+            "description": (
+                "Restrict search to one indexed project by name (see "
+                "list_projects). Overrides cwd-based scope detection. "
+                "Use when you want an explicit single-project query."
+            ),
+        },
+        "max_tokens": {
+            "type": "integer",
+            "default": 4096,
+            "description": (
+                "Cap on total tokens across returned chunks (greedy "
+                "take-until-overflow). Default 4096 fits most agent "
+                "context windows. Lower to 1024-2048 for small windows; "
+                "raise to 8000-16000 for large-context agents."
+            ),
+        },
+        "max_results": {
+            "type": ["integer", "null"],
+            "description": (
+                "Optional hard cap on chunk count. Prefer max_tokens "
+                "(token-budget aware). Use max_results only when you "
+                "need a count-based limit (e.g. 'top 3 hits')."
+            ),
+        },
+        "wait_for_quiescence_ms": {
+            "type": ["integer", "null"],
+            "description": (
+                "Block up to N ms waiting for in-flight index updates "
+                "to drain before searching. Default 500. Set 0 for "
+                "zero-wait; set 2000-5000 when you just wrote many "
+                "files and want the next search to see them."
+            ),
+        },
+        "relevance_floor": {
+            "type": ["number", "null"],
+            "description": (
+                "Per-call override of the dense-cosine relevance floor "
+                "(default per project ~0.50). Top-1 cosine below this "
+                "returns empty chunks + ``no_relevant_results=true``. "
+                "Pass 0.0 to disable the floor entirely (get raw "
+                "results even for low-confidence queries); pass 0.65+ "
+                "to require strong matches only."
+            ),
+        },
+        "auto_policy": {
+            "type": "boolean",
+            "default": False,
+            "description": (
+                "Opt into context-size + query-shape adaptive routing. "
+                "When true, the searcher detects query shape "
+                "(symbolic / prose / mixed), estimates corpus size, "
+                "and rebalances BM25 vs dense weights for this call. "
+                "Surfaces ``applied_policy_rationale`` and "
+                "``embedder_hint`` on the response. Default false."
+            ),
+        },
         "prior_context": {
             "oneOf": [
                 {"type": "string"},
                 {"type": "array", "items": {"type": "string"}},
                 {"type": "null"},
             ],
+            "description": (
+                "Iterative-retrieval input. Text capturing what the "
+                "agent already knows: prior error traces, observations "
+                "from earlier turns, partial-fix notes, refined query "
+                "phrasings. Embedded and MIXED into the query vector at "
+                "``prior_context_weight`` so the next round drifts "
+                "toward the refined understanding. Use after a first "
+                "search didn't quite answer — pass the new information "
+                "you learned. AutoCodeRover-style retry pattern."
+            ),
         },
-        "prior_context_weight": {"type": "number", "default": 0.3},
+        "prior_context_weight": {
+            "type": "number",
+            "default": 0.3,
+            "description": (
+                "How heavily to mix ``prior_context`` into the query. "
+                "0.0 = ignore prior; 0.3 = light bias (default); 0.5+ "
+                "= strong drift toward prior direction. Higher when "
+                "the prior IS the question (e.g. an error trace); "
+                "lower for soft refinements."
+            ),
+        },
         "suppress_ids": {
             "oneOf": [
                 {"type": "array", "items": {"type": "integer"}},
                 {"type": "null"},
             ],
+            "description": (
+                "List of chunk_id ints the agent has ALREADY been "
+                "shown (read off ``chunk_id`` on prior response "
+                "chunks). Matching chunks are filtered before the "
+                "token-budget take so the next call surfaces NEW "
+                "results. Use whenever you want different chunks than "
+                "the last call returned — cheaper than re-querying "
+                "with reshuffled keywords."
+            ),
         },
     },
     "required": ["query"],
@@ -204,20 +499,44 @@ _LIST_PROJECTS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {},
     "additionalProperties": False,
+    "description": "No parameters.",
 }
 
 _INDEX_STATUS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {},
     "additionalProperties": False,
+    "description": "No parameters.",
 }
 
 _FIND_RELATED_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "file_path": {"type": "string"},
-        "line": {"type": ["integer", "null"]},
-        "max_results": {"type": "integer", "default": 5},
+        "file_path": {
+            "type": "string",
+            "description": (
+                "Repo-relative path of the anchor file. The "
+                "``<project>/<rel_path>`` form returned by "
+                "search_codebase's chunk citations works directly."
+            ),
+        },
+        "line": {
+            "type": ["integer", "null"],
+            "description": (
+                "Optional 1-indexed line number inside ``file_path``. "
+                "Specify when you want similarity to ONE function or "
+                "section in the file. Omit (or pass null) to anchor "
+                "on the whole file."
+            ),
+        },
+        "max_results": {
+            "type": "integer",
+            "default": 5,
+            "description": (
+                "Number of nearest matches to return. Default 5. "
+                "Higher = more recall, more noise."
+            ),
+        },
     },
     "required": ["file_path"],
     "additionalProperties": False,
@@ -225,7 +544,16 @@ _FIND_RELATED_SCHEMA: dict[str, Any] = {
 
 _SET_ACTIVE_PROJECT_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "properties": {"project": {"type": "string"}},
+    "properties": {
+        "project": {
+            "type": "string",
+            "description": (
+                "Project name to pin as the sticky scope for the rest "
+                "of this MCP session. Case-sensitive. Must already "
+                "exist in list_projects output."
+            ),
+        },
+    },
     "required": ["project"],
     "additionalProperties": False,
 }
@@ -233,8 +561,24 @@ _SET_ACTIVE_PROJECT_SCHEMA: dict[str, Any] = {
 _ADD_PROJECT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "path": {"type": "string"},
-        "persist": {"type": "boolean", "default": False},
+        "path": {
+            "type": "string",
+            "description": (
+                "Absolute filesystem path of the directory to index "
+                "as a new project. Must exist and be readable."
+            ),
+        },
+        "persist": {
+            "type": "boolean",
+            "default": False,
+            "description": (
+                "When true, save the new project to daemon config so "
+                "it survives daemon restarts. When false (default), "
+                "the project lives only for the current daemon "
+                "process. Agents typically pass false unless the "
+                "user explicitly wants persistence."
+            ),
+        },
     },
     "required": ["path"],
     "additionalProperties": False,
@@ -243,8 +587,23 @@ _ADD_PROJECT_SCHEMA: dict[str, Any] = {
 _WAIT_FOR_QUIESCENCE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "project": {"type": ["string", "null"]},
-        "timeout_ms": {"type": "integer", "default": 2000},
+        "project": {
+            "type": ["string", "null"],
+            "description": (
+                "Project name to wait on. Omit (or pass null) to "
+                "wait for ALL projects' update queues to drain."
+            ),
+        },
+        "timeout_ms": {
+            "type": "integer",
+            "default": 2000,
+            "description": (
+                "Maximum block duration in milliseconds. Always set "
+                "a finite value — indefinite blocking is not "
+                "supported. 2000-5000 ms is typical after a write "
+                "burst."
+            ),
+        },
     },
     "additionalProperties": False,
 }
