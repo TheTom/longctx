@@ -1707,7 +1707,175 @@ def build_parser() -> argparse.ArgumentParser:
         return 1
     service.set_defaults(func=_cmd_service)
 
+    # --- pack: registry for pre-built (SqliteChunkStore, MemmapEmbedStore)
+    # pairs that the daemon can mount as additional projects. See
+    # ``longctx_daemon/packs.py`` for the on-disk format. v1 is manual
+    # add/rm/list/info; the Mini-LLM controller will add auto-pick later.
+    pack = sub.add_parser(
+        "pack",
+        help="Manage pre-built corpus packs.",
+        description=(
+            "Register, list, and inspect pre-built corpus packs (the "
+            "drop-in artifacts produced by offline ingest, e.g. "
+            "corpora/swezero-12m/ingest.py). v1 is manual selection — "
+            "the Mini-LLM controller will auto-pick in a later phase."
+        ),
+    )
+    pack_sub = pack.add_subparsers(dest="pack_command", required=True)
+
+    pack_list = pack_sub.add_parser(
+        "list", help="List registered packs.",
+    )
+    pack_list.add_argument(
+        "--json", action="store_true",
+        help="Emit JSON for scripting; default is a pretty table.",
+    )
+    pack_list.set_defaults(func=_cmd_pack_list)
+
+    pack_add = pack_sub.add_parser(
+        "add", help="Register a pack from a directory.",
+    )
+    pack_add.add_argument(
+        "path",
+        help="Pack directory (must contain chunks.sqlite + embeds/*.idx).",
+    )
+    pack_add.add_argument(
+        "--name", default=None,
+        help="Pack name. Defaults to <corpus>-<lang> for paths under "
+             "corpora/<corpus>/<lang>, else the directory basename.",
+    )
+    pack_add.add_argument(
+        "--dedup", default="auto", choices=("auto", "on", "off"),
+        help="Apply dedup_by_doc_root at search time. 'auto' = on for "
+             "packs whose name starts with swezero-, else off.",
+    )
+    pack_add.set_defaults(func=_cmd_pack_add)
+
+    pack_rm = pack_sub.add_parser(
+        "rm", help="Unregister a pack (on-disk files NOT deleted).",
+    )
+    pack_rm.add_argument("name", help="Pack name (see ``longctx pack list``).")
+    pack_rm.set_defaults(func=_cmd_pack_rm)
+
+    pack_info = pack_sub.add_parser(
+        "info", help="Show full pack details + embedder identity.",
+    )
+    pack_info.add_argument("name", help="Pack name.")
+    pack_info.add_argument(
+        "--json", action="store_true",
+        help="Emit JSON for scripting.",
+    )
+    pack_info.set_defaults(func=_cmd_pack_info)
+
     return p
+
+
+def _human_bytes(n: int) -> str:
+    """Format ``n`` bytes as a short human-readable string."""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+        n = n / 1024
+    return f"{n:.1f} PB"
+
+
+def _cmd_pack_list(args: argparse.Namespace) -> int:
+    """``longctx pack list``."""
+    from longctx_daemon.packs import PackRegistry
+    reg = PackRegistry()
+    packs = reg.list()
+
+    if args.json:
+        print(json.dumps(
+            {"packs": [asdict(p) for p in packs]}, indent=2,
+        ))
+        return 0
+
+    if not packs:
+        print("no packs registered. add one with: longctx pack add <path>")
+        return 0
+
+    print(f"{'name':<28} {'chunks':>12} {'size':>10} dedup  embedder")
+    print("-" * 80)
+    for p in packs:
+        print(
+            f"{p.name:<28} {p.chunk_count:>12,} "
+            f"{_human_bytes(p.size_bytes):>10} "
+            f"{'on' if p.dedup_by_doc_root else 'off':<6} "
+            f"{p.embedder_model}"
+        )
+    return 0
+
+
+def _cmd_pack_add(args: argparse.Namespace) -> int:
+    """``longctx pack add <path>``."""
+    from longctx_daemon.packs import PackRegistry
+    dedup_arg = {
+        "auto": None,
+        "on": True,
+        "off": False,
+    }[args.dedup]
+    try:
+        pack = PackRegistry().register(
+            Path(args.path),
+            name=args.name,
+            dedup_by_doc_root=dedup_arg,
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"registered: {pack.name}\n"
+        f"  path: {pack.path}\n"
+        f"  chunks: {pack.chunk_count:,}\n"
+        f"  size: {_human_bytes(pack.size_bytes)}\n"
+        f"  embedder: {pack.embedder_model} ({pack.embed_dim}d)\n"
+        f"  dedup_by_doc_root: {'on' if pack.dedup_by_doc_root else 'off'}"
+    )
+    return 0
+
+
+def _cmd_pack_rm(args: argparse.Namespace) -> int:
+    """``longctx pack rm <name>``."""
+    from longctx_daemon.packs import PackRegistry
+    reg = PackRegistry()
+    if not reg.unregister(args.name):
+        print(f"error: no pack named {args.name!r}", file=sys.stderr)
+        return 1
+    print(f"unregistered: {args.name} (on-disk files preserved)")
+    return 0
+
+
+def _cmd_pack_info(args: argparse.Namespace) -> int:
+    """``longctx pack info <name>``."""
+    from longctx_daemon.packs import PackRegistry
+    reg = PackRegistry()
+    pack = reg.get(args.name)
+    if pack is None:
+        print(f"error: no pack named {args.name!r}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(asdict(pack), indent=2))
+        return 0
+    import time as _t
+    reg_iso = _t.strftime("%Y-%m-%d %H:%M:%S", _t.localtime(pack.registered_at))
+    used_iso = (
+        _t.strftime("%Y-%m-%d %H:%M:%S", _t.localtime(pack.last_used_at))
+        if pack.last_used_at > 0 else "never"
+    )
+    print(
+        f"name: {pack.name}\n"
+        f"path: {pack.path}\n"
+        f"chunks: {pack.chunk_count:,}\n"
+        f"size: {_human_bytes(pack.size_bytes)}\n"
+        f"embed_dim: {pack.embed_dim}\n"
+        f"embedder_model: {pack.embedder_model}\n"
+        f"embedder_sha256: {pack.embedder_sha256}\n"
+        f"dedup_by_doc_root: {'on' if pack.dedup_by_doc_root else 'off'}\n"
+        f"registered_at: {reg_iso}\n"
+        f"last_used_at: {used_iso}"
+    )
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
