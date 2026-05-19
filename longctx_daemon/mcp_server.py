@@ -1418,6 +1418,9 @@ def _search_chunk_to_dict(sc) -> dict[str, Any]:
     cos = getattr(sc, "dense_cosine", None)
     if cos is not None:
         out["dense_cosine"] = float(cos)
+    cid = getattr(sc, "chunk_id", None)
+    if cid is not None:
+        out["chunk_id"] = int(cid)
     return out
 
 
