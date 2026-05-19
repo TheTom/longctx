@@ -876,9 +876,18 @@ class Searcher:
                             continue
                         seen_dedup_keys.add(key)
                 tok = self._chunk_token_count(chunk)
-                if tok > budget:
-                    # Single chunk overflows; stop here so we never
-                    # exceed the cap.
+                if tok > budget and kept:
+                    # Already returning something; stop before overflowing
+                    # further. If we have NOTHING yet, keep this single
+                    # over-budget chunk anyway — returning empty would
+                    # hide a valid match (top1_dense_cosine well above
+                    # the floor) from the agent and lead to "no result"
+                    # fabrications. Bug surfaced 2026-05-19 when an
+                    # agent passed max_tokens=2000 against a corpus
+                    # chunked at 2048 — every search returned zero.
+                    # The MCP layer downstream applies max_tokens again
+                    # with its own "keep at least one" guard, so a
+                    # slightly oversized first chunk passes through.
                     break
                 citation = self._build_citation(chunk)
                 cos = dense_cosine_by_id.get(chunk.id)
