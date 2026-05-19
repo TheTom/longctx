@@ -113,6 +113,12 @@ class SearchChunk:
     relevance_score: float
     token_count: int
     dense_cosine: Optional[float] = None
+    chunk_id: Optional[int] = None
+    """Internal chunk PK. Exposed so callers running iterative retrieval
+    (AutoCodeRover-style retry loops) can pass the prior round's chunk
+    ids back as ``Searcher.search(suppress_ids=...)`` to dedup what the
+    agent has already been shown. ``None`` on test fakes that don't set
+    it; production results always carry the int."""
 
 
 @dataclass(frozen=True)

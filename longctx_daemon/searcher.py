@@ -22,7 +22,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, Optional, Sequence
+from typing import Callable, Iterable, Optional, Sequence, Union
 
 import numpy as np
 
@@ -526,6 +526,9 @@ class Searcher:
         relevance_floor: Optional[float] = None,
         auto_policy: bool = False,
         dedup_by_doc_root: Optional[bool] = None,
+        prior_context: Union[str, Sequence[str], None] = None,
+        prior_context_weight: float = 0.3,
+        suppress_ids: Optional[Iterable[int]] = None,
     ) -> SearchResult:
         """Run one search end-to-end and return a ``SearchResult``.
 
@@ -556,6 +559,27 @@ class Searcher:
         rationale + embedder hint are surfaced on the result so the
         caller can see why this stack was picked. Default False keeps
         production behavior unchanged.
+
+        ``prior_context`` is the AutoCodeRover-style iterative retrieval
+        hook (per the ``project_iterative_retrieval_api`` PRD memory and
+        line 1099 of the longctx Workflow Guidance Layer PRD). Accepts
+        a single string or a sequence of strings — error traces, prior
+        agent observations, previous-turn queries, anything that
+        captures the agent's growing belief about the problem. Each
+        string is embedded and the mean of those embeddings is mixed
+        into every query/paraphrase embedding at weight
+        ``prior_context_weight`` (default 0.3 per the PRD sketch):
+        ``q' = normalize((1-w) * q + w * mean(prior_embs))``. The mix
+        is a no-op when ``prior_context`` is None / empty or weight
+        is zero, so the parameter is safe to pass through pipelines
+        that may or may not have prior context.
+
+        ``suppress_ids`` is the dedup half of iterative retrieval.
+        Accepts any iterable of chunk-PK ints (read off
+        ``SearchChunk.chunk_id`` from a prior result). Matching chunks
+        are filtered out before the token-budget take so the agent
+        never sees a chunk it was already shown. Cheap O(top-K) set
+        check, no second SQLite round-trip.
         """
         # Per-call policy resolution. ``query_shape`` is always
         # populated (cheap regex); the *_weight overrides only apply
@@ -592,8 +616,23 @@ class Searcher:
 
         # ---- Stage: embed_query
         queries = (query, *paraphrases)
+        # Normalize prior_context to a tuple of strings up front so the
+        # downstream mix code can treat the single-string and list cases
+        # identically. Empty list or whitespace-only strings get dropped
+        # so callers passing prior_context=[] don't accidentally pay the
+        # encode cost for nothing.
+        prior_texts: tuple[str, ...] = ()
+        if prior_context is not None:
+            if isinstance(prior_context, str):
+                prior_texts = (prior_context,) if prior_context.strip() else ()
+            else:
+                prior_texts = tuple(
+                    s for s in prior_context if isinstance(s, str) and s.strip()
+                )
         t0 = time.perf_counter()
-        query_embs = self._embed_queries(queries)
+        query_embs = self._embed_queries_with_prior(
+            queries, prior_texts, float(prior_context_weight),
+        )
         embed_ms = (time.perf_counter() - t0) * 1000.0
 
         top_n = self._config.default_top_k_for_fusion
@@ -658,7 +697,18 @@ class Searcher:
         )
         # Cap the post-fusion list at top_n so we don't pay for
         # materializing chunks that won't make it past the token budget.
+        # When ``suppress_ids`` is set we widen the cap so the downstream
+        # hot loop has enough survivors after filtering — otherwise an
+        # agent that suppresses the prior top-K can end up with an
+        # empty result even when more relevant chunks exist further
+        # down the ranking. Widening by len(suppress_ids) is the
+        # tightest bound that guarantees the filter never starves the
+        # take loop.
+        suppress_count = (
+            len(set(suppress_ids)) if suppress_ids is not None else 0
+        )
         cap = max_results if max_results is not None else top_n
+        cap = min(cap + suppress_count, top_n)
         fused = fused[:max(cap, 1)]
 
         # Build chunk_id → max-cosine-across-queries map. Dense store
@@ -808,9 +858,17 @@ class Searcher:
             # are kept. When ``dedup_by_doc_root`` is on, also skip
             # chunks whose doc-root key was already taken — see
             # ``SearcherConfig.dedup_by_doc_root`` for the rationale.
+            # ``suppress_ids`` (iterative retrieval) is the third filter
+            # gate: drop chunk-PKs the agent has already been shown
+            # this session before they consume budget.
             budget = max_tokens
             seen_dedup_keys: set[str] = set()
+            suppress_set: set[int] = (
+                set(suppress_ids) if suppress_ids is not None else set()
+            )
             for chunk, score in ranked_chunks:
+                if suppress_set and chunk.id in suppress_set:
+                    continue
                 if effective_dedup:
                     key = dedup_key_by_chunk_id.get(chunk.id)
                     if key is not None:
@@ -832,6 +890,7 @@ class Searcher:
                         relevance_score=float(score),
                         token_count=tok,
                         dense_cosine=cos,
+                        chunk_id=int(chunk.id),
                     ),
                 ))
                 budget -= tok
@@ -898,6 +957,9 @@ class Searcher:
         active_project_sticky: Optional[str] = None,
         relevance_floor: Optional[float] = None,
         dedup_by_doc_root: Optional[bool] = None,
+        prior_context: Union[str, Sequence[str], None] = None,
+        prior_context_weight: float = 0.3,
+        suppress_ids: Optional[Iterable[int]] = None,
     ) -> MultiSearchResult:
         """Run N independent searches for N sub-queries.
 
@@ -944,9 +1006,17 @@ class Searcher:
                 latency_ms=LatencyBreakdown(),
             )
 
+        # ``suppress_ids`` accumulates across groups: once a chunk has
+        # been surfaced in group N it is hidden from groups N+1.. so
+        # the agent never sees the same chunk twice across sub-queries
+        # in a single multi-search call. Each group's contribution is
+        # the ``chunk_id``s of every kept chunk.
+        accumulated_suppress: set[int] = (
+            set(suppress_ids) if suppress_ids is not None else set()
+        )
         groups: list[SearchResult] = []
         for q in queries_t:
-            groups.append(self.search(
+            result = self.search(
                 q,
                 cwd=cwd,
                 project=project,
@@ -956,7 +1026,14 @@ class Searcher:
                 active_project_sticky=active_project_sticky,
                 relevance_floor=relevance_floor,
                 dedup_by_doc_root=dedup_by_doc_root,
-            ))
+                prior_context=prior_context,
+                prior_context_weight=prior_context_weight,
+                suppress_ids=accumulated_suppress if accumulated_suppress else None,
+            )
+            groups.append(result)
+            for sc in result.chunks:
+                if sc.chunk_id is not None:
+                    accumulated_suppress.add(int(sc.chunk_id))
 
         # ---- Collapse shared fields
         first_scope = groups[0].scope_decision
@@ -1174,6 +1251,55 @@ class Searcher:
             normalize_embeddings=True,
         )
         return np.asarray(embs)
+
+    def _embed_queries_with_prior(
+        self,
+        queries: tuple[str, ...],
+        prior_texts: tuple[str, ...],
+        weight: float,
+    ) -> np.ndarray:
+        """Embed queries and optionally mix with prior-context vector.
+
+        When ``prior_texts`` is empty or ``weight <= 0``, returns the
+        plain ``_embed_queries(queries)`` result unchanged — the mix
+        is a complete no-op so iterative-retrieval calls with no prior
+        context collapse to the standard search path.
+
+        Otherwise:
+          1. Encode prior_texts in one batch (normalized).
+          2. Take their mean and re-normalize to a unit vector. This
+             is the simplest stable summary; weighted mixing or
+             attention over prior turns is a v2 concern.
+          3. Per query: ``mixed = (1 - w) * q + w * prior_mean``,
+             then L2-normalize. The result is still a unit vector so
+             ``EmbedStore.search_dense``'s dot-product cosine semantics
+             stay intact.
+
+        Weight is clamped to [0, 1]. Values outside the range fall
+        back to clipped — keeps the math sensible even when callers
+        do dumb things like ``weight=2.0``.
+        """
+        base = self._embed_queries(queries)
+        if not prior_texts or weight <= 0.0 or base.size == 0:
+            return base
+        w = min(max(float(weight), 0.0), 1.0)
+        prior_embs = self._embedder.encode(
+            list(prior_texts),
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+        prior_arr = np.asarray(prior_embs)
+        if prior_arr.ndim == 1:
+            prior_mean = prior_arr
+        else:
+            prior_mean = prior_arr.mean(axis=0)
+        norm = float(np.linalg.norm(prior_mean))
+        if norm > 0.0:
+            prior_mean = prior_mean / norm
+        mixed = (1.0 - w) * base + w * prior_mean[None, :]
+        norms = np.linalg.norm(mixed, axis=1, keepdims=True)
+        norms = np.where(norms == 0.0, 1.0, norms)
+        return mixed / norms
 
     def _rrf_fuse(
         self,
