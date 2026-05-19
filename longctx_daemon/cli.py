@@ -1767,6 +1767,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pack_info.set_defaults(func=_cmd_pack_info)
 
+    pack_scan = pack_sub.add_parser(
+        "scan",
+        help="Auto-register every valid pack found under a directory.",
+        description=(
+            "Walks the given root (default ~/.cache/longctx/corpora) up "
+            "to 4 levels deep and registers any directory that looks "
+            "like a pack (contains chunks.sqlite + embeds/*.idx). "
+            "Idempotent: already-registered packs get their stats "
+            "refreshed in place."
+        ),
+    )
+    pack_scan.add_argument(
+        "path", nargs="?", default=None,
+        help="Root directory to scan (default ~/.cache/longctx/corpora).",
+    )
+    pack_scan.add_argument(
+        "--prune", action="store_true",
+        help="Also unregister packs whose path no longer exists on disk.",
+    )
+    pack_scan.add_argument(
+        "--json", action="store_true",
+        help="Emit JSON for scripting.",
+    )
+    pack_scan.set_defaults(func=_cmd_pack_scan)
+
     return p
 
 
@@ -1843,6 +1868,41 @@ def _cmd_pack_rm(args: argparse.Namespace) -> int:
         print(f"error: no pack named {args.name!r}", file=sys.stderr)
         return 1
     print(f"unregistered: {args.name} (on-disk files preserved)")
+    return 0
+
+
+def _cmd_pack_scan(args: argparse.Namespace) -> int:
+    """``longctx pack scan [<path>]``."""
+    from longctx_daemon.packs import PackRegistry, DEFAULT_PACK_ROOT
+    root = Path(args.path) if args.path else DEFAULT_PACK_ROOT
+    reg = PackRegistry()
+    added, refreshed, pruned = reg.scan(root, prune_missing=args.prune)
+
+    if args.json:
+        print(json.dumps({
+            "root": str(root.expanduser().resolve()),
+            "added": [p.name for p in added],
+            "refreshed": [p.name for p in refreshed],
+            "pruned": list(pruned),
+        }, indent=2))
+        return 0
+
+    print(f"scanned: {root.expanduser().resolve()}")
+    print(f"  added:     {len(added)}")
+    for p in added:
+        print(f"    + {p.name}  ({p.chunk_count:,} chunks, "
+              f"{_human_bytes(p.size_bytes)}, dedup="
+              f"{'on' if p.dedup_by_doc_root else 'off'})")
+    print(f"  refreshed: {len(refreshed)}")
+    for p in refreshed:
+        print(f"    ~ {p.name}  ({p.chunk_count:,} chunks, "
+              f"{_human_bytes(p.size_bytes)})")
+    if args.prune:
+        print(f"  pruned:    {len(pruned)}")
+        for n in pruned:
+            print(f"    - {n}")
+    if not added and not refreshed and not pruned:
+        print("  (nothing to do)")
     return 0
 
 

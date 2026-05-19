@@ -267,8 +267,94 @@ class PackRegistry:
         self._packs[name] = Pack(**{**asdict(p), "last_used_at": time.time()})
         self._save()
 
+    def scan(
+        self,
+        root: Optional[Path] = None,
+        *,
+        prune_missing: bool = False,
+    ) -> tuple[tuple[Pack, ...], tuple[Pack, ...], tuple[str, ...]]:
+        """Walk ``root`` looking for valid pack directories and register
+        each one found.
+
+        A directory is a valid pack iff it directly contains both
+        ``chunks.sqlite`` and an ``embeds/`` subdir with at least one
+        ``*.idx`` file. Walks 4 levels deep (enough for
+        ``corpora/<corpus>/<lang>`` plus a generic parent), skips
+        hidden directories.
+
+        Idempotent — already-registered packs are refreshed (chunk
+        count + size_bytes re-snapshotted) rather than duplicated.
+
+        When ``prune_missing`` is True, registered packs whose ``path``
+        no longer exists on disk are unregistered as part of the same
+        scan. Useful for cleaning up after rebuilds.
+
+        Returns ``(newly_added, refreshed, pruned_names)``.
+        """
+        root = (root or DEFAULT_PACK_ROOT).expanduser().resolve()
+        if not root.is_dir():
+            return ((), (), ())
+
+        # Find candidate pack dirs: anything with chunks.sqlite AND embeds/
+        candidates: list[Path] = []
+        for d in _walk_dirs(root, max_depth=4):
+            if (d / "chunks.sqlite").is_file() and (d / "embeds").is_dir():
+                candidates.append(d)
+
+        added: list[Pack] = []
+        refreshed: list[Pack] = []
+        seen_paths: set[str] = set()
+        for cand in candidates:
+            cand_str = str(cand)
+            seen_paths.add(cand_str)
+            prev_by_path = next(
+                (p for p in self._packs.values() if p.path == cand_str), None
+            )
+            try:
+                pack = self.register(cand)
+            except ValueError:
+                # Skip invalid packs silently — scan should never fail
+                # the whole batch on one bad entry.
+                continue
+            if prev_by_path is None:
+                added.append(pack)
+            else:
+                refreshed.append(pack)
+
+        pruned: list[str] = []
+        if prune_missing:
+            stale_names = [
+                p.name for p in self._packs.values()
+                if not Path(p.path).is_dir()
+            ]
+            for n in stale_names:
+                self.unregister(n)
+                pruned.append(n)
+
+        return tuple(added), tuple(refreshed), tuple(pruned)
+
 
 # --------------------------------------------------------------- helpers
+
+def _walk_dirs(root: Path, *, max_depth: int = 4):
+    """Yield directories under ``root`` up to ``max_depth`` levels deep,
+    skipping hidden directories. Tolerant of OSError mid-walk."""
+    def _walk(current: Path, depth: int):
+        if depth > max_depth:
+            return
+        yield current
+        try:
+            entries = list(current.iterdir())
+        except OSError:
+            return
+        for entry in entries:
+            if entry.name.startswith("."):
+                continue
+            if not entry.is_dir():
+                continue
+            yield from _walk(entry, depth + 1)
+    yield from _walk(root, 0)
+
 
 def _du_bytes(path: Path) -> int:
     """Total byte size under ``path`` (recursive). Tolerant of broken
