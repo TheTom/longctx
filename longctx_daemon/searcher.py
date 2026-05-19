@@ -234,6 +234,19 @@ class SearcherConfig:
     types; populated via ``longctx calibrate --project NAME --write-config``
     (Phase 3 follow-up). Empty dict (default) keeps the global floor."""
 
+    dedup_by_doc_root: bool = False
+    """When True, post-fusion results are deduplicated by the chunk's
+    "document root" so the same source document doesn't return N
+    near-duplicate chunks in the top-K. Document root = the chunk's
+    file ``rel_path`` with a trailing ``.HHHHHHHHHHHH`` content-hash
+    suffix stripped (the SWE-ZERO ingest pattern; see
+    ``corpora/swezero-12m/ingest.py``). Files without that suffix
+    dedup on the full ``rel_path``. Off by default to keep behavior
+    identical for callers that haven't opted in. Required for the
+    SWE-ZERO trajectory corpus where 100 rollouts per PR produce
+    100 near-identical embeddings — without dedup top-5 returns
+    5 copies of the same trajectory's chunk."""
+
 
 # ------------------------------------------------------------- scope routing
 
@@ -512,6 +525,7 @@ class Searcher:
         paraphrases: tuple[str, ...] = (),
         relevance_floor: Optional[float] = None,
         auto_policy: bool = False,
+        dedup_by_doc_root: Optional[bool] = None,
     ) -> SearchResult:
         """Run one search end-to-end and return a ``SearchResult``.
 
@@ -774,11 +788,35 @@ class Searcher:
 
                 ranked_chunks.sort(key=_augment_key)
 
+            # Pre-fetch dedup keys when dedup_by_doc_root is on. We
+            # need each chunk's source file rel_path to compute the
+            # doc-root key; batch the file_id lookups so the loop
+            # below stays O(1) per chunk instead of O(SQLite-round-
+            # trip) per chunk.
+            effective_dedup = (
+                dedup_by_doc_root if dedup_by_doc_root is not None
+                else self._config.dedup_by_doc_root
+            )
+            dedup_key_by_chunk_id: dict[int, str] = {}
+            if effective_dedup:
+                dedup_key_by_chunk_id = self._build_dedup_keys(
+                    [c for c, _ in ranked_chunks]
+                )
+
             # Token-budget enforcement: greedy take-until-overflow.
             # Ordered by fused score so the highest-relevance chunks
-            # are kept.
+            # are kept. When ``dedup_by_doc_root`` is on, also skip
+            # chunks whose doc-root key was already taken — see
+            # ``SearcherConfig.dedup_by_doc_root`` for the rationale.
             budget = max_tokens
+            seen_dedup_keys: set[str] = set()
             for chunk, score in ranked_chunks:
+                if effective_dedup:
+                    key = dedup_key_by_chunk_id.get(chunk.id)
+                    if key is not None:
+                        if key in seen_dedup_keys:
+                            continue
+                        seen_dedup_keys.add(key)
                 tok = self._chunk_token_count(chunk)
                 if tok > budget:
                     # Single chunk overflows; stop here so we never
@@ -859,6 +897,7 @@ class Searcher:
         wait_for_quiescence_ms: Optional[int] = None,
         active_project_sticky: Optional[str] = None,
         relevance_floor: Optional[float] = None,
+        dedup_by_doc_root: Optional[bool] = None,
     ) -> MultiSearchResult:
         """Run N independent searches for N sub-queries.
 
@@ -916,6 +955,7 @@ class Searcher:
                 wait_for_quiescence_ms=wait_for_quiescence_ms,
                 active_project_sticky=active_project_sticky,
                 relevance_floor=relevance_floor,
+                dedup_by_doc_root=dedup_by_doc_root,
             ))
 
         # ---- Collapse shared fields
@@ -1209,6 +1249,41 @@ class Searcher:
             start_line=chunk.start_line,
             end_line=chunk.end_line,
         )
+
+    # Match a trailing ``.HHHHHHHHHHHH`` content-hash suffix as written
+    # by the SWE-ZERO ingest (12 lowercase hex chars). When stripped
+    # off a rel_path, what remains is the document root that multiple
+    # near-duplicate chunks share.
+    _DOC_ROOT_HASH_RE = re.compile(r"\.[0-9a-f]{12}$")
+
+    def _build_dedup_keys(self, chunks) -> dict[int, str]:
+        """Compute a "doc root" dedup key per chunk.id, batching the
+        file_id → rel_path lookups so the search loop stays O(1) per
+        chunk. The key is the chunk's project + rel_path with any
+        trailing content-hash suffix stripped — chunks that share that
+        root collapse to one in the dedup pass. Returns ``{}`` when the
+        chunk store doesn't expose ``get_file_by_id`` (test fakes)."""
+        get_file = getattr(self._chunk_store, "get_file_by_id", None)
+        if not callable(get_file):
+            return {}
+        file_id_to_key: dict[int, str] = {}
+        keys: dict[int, str] = {}
+        for chunk in chunks:
+            fid = chunk.file_id
+            if fid in file_id_to_key:
+                keys[chunk.id] = file_id_to_key[fid]
+                continue
+            try:
+                file_rec = get_file(fid)
+            except Exception:  # noqa: BLE001
+                continue
+            if file_rec is None:
+                continue
+            stripped = self._DOC_ROOT_HASH_RE.sub("", file_rec.rel_path)
+            key = f"{file_rec.project}::{stripped}"
+            file_id_to_key[fid] = key
+            keys[chunk.id] = key
+        return keys
 
     def _chunk_path_abs(self, chunk) -> str:
         """Best-effort absolute path for a chunk's source file.
