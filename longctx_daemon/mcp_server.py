@@ -83,6 +83,18 @@ _SEARCH_CODEBASE_DOC = (
     "    wait_for_quiescence_ms: Block up to N ms waiting for in-flight index\n"
     "        updates to drain before searching. Default 500. Pass 0 for\n"
     "        zero-wait; pass 2000 if the agent just wrote many files.\n"
+    "    prior_context: Optional text (string or list of strings) capturing\n"
+    "        what you already know about the problem — prior error traces,\n"
+    "        previous query phrasings, observations from earlier turns.\n"
+    "        Mixed into the query embedding so the next round drifts\n"
+    "        toward what you've learned. AutoCodeRover-style retry pattern.\n"
+    "    prior_context_weight: How heavily to mix prior_context into the\n"
+    "        query. 0.0 = ignore prior; 0.3 = light bias (default); 0.5+\n"
+    "        = strong bias toward prior direction.\n"
+    "    suppress_ids: List of chunk_id ints already shown to the agent\n"
+    "        (read from prior response chunks). Filtered out so the next\n"
+    "        round returns DIFFERENT chunks. Use this to surface new\n"
+    "        evidence after a first round didn't help.\n"
     "\n"
     "Returns:\n"
     "    SearchResponse with:\n"
@@ -165,6 +177,24 @@ _SEARCH_CODEBASE_SCHEMA: dict[str, Any] = {
         # overrides retrieval weights for THIS call. Surfaces
         # rationale + embedder hint on the response.
         "auto_policy": {"type": "boolean", "default": False},
+        # 2026-05-19: iterative retrieval (AutoCodeRover-style retry).
+        # prior_context mixes prior text/observations into the query
+        # embedding; suppress_ids drops chunks the agent has already
+        # been shown. See SearcherConfig docs + commit bb88867.
+        "prior_context": {
+            "oneOf": [
+                {"type": "string"},
+                {"type": "array", "items": {"type": "string"}},
+                {"type": "null"},
+            ],
+        },
+        "prior_context_weight": {"type": "number", "default": 0.3},
+        "suppress_ids": {
+            "oneOf": [
+                {"type": "array", "items": {"type": "integer"}},
+                {"type": "null"},
+            ],
+        },
     },
     "required": ["query"],
     "additionalProperties": False,
@@ -587,6 +617,9 @@ class MCPServer:
         wait_ms = args.get("wait_for_quiescence_ms")
         relevance_floor = args.get("relevance_floor")
         auto_policy = bool(args.get("auto_policy", False))
+        prior_context = args.get("prior_context")
+        prior_context_weight = args.get("prior_context_weight", 0.3)
+        suppress_ids = args.get("suppress_ids")
 
         # Sticky session: when caller didn't pass project= or cwd, use
         # the session's set_active_project value (PRD §3.4 / §3.9). The
@@ -604,6 +637,9 @@ class MCPServer:
                 relevance_floor=relevance_floor,
                 sticky=sticky,
                 auto_policy=auto_policy,
+                prior_context=prior_context,
+                prior_context_weight=prior_context_weight,
+                suppress_ids=suppress_ids,
             )
 
         # ---------- single-string path (Phase 2.0 contract) ----------
@@ -621,10 +657,18 @@ class MCPServer:
             kwargs["relevance_floor"] = relevance_floor
         if auto_policy:
             kwargs["auto_policy"] = True
+        if prior_context is not None:
+            kwargs["prior_context"] = prior_context
+            kwargs["prior_context_weight"] = float(prior_context_weight)
+        if suppress_ids:
+            kwargs["suppress_ids"] = list(suppress_ids)
         try:
             result = self.searcher.search(**kwargs)
         except TypeError:
             # Older fakes don't take new kwargs — drop them progressively.
+            kwargs.pop("suppress_ids", None)
+            kwargs.pop("prior_context", None)
+            kwargs.pop("prior_context_weight", None)
             kwargs.pop("active_project_sticky", None)
             kwargs.pop("relevance_floor", None)
             kwargs.pop("auto_policy", None)
@@ -716,6 +760,9 @@ class MCPServer:
         relevance_floor: Optional[float],
         sticky: Optional[str],
         auto_policy: bool = False,
+        prior_context: Any = None,
+        prior_context_weight: float = 0.3,
+        suppress_ids: Any = None,
     ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
         """Phase 2.0.1 multi-question path.
 
@@ -743,12 +790,20 @@ class MCPServer:
             kwargs["relevance_floor"] = relevance_floor
         if auto_policy:
             kwargs["auto_policy"] = True
+        if prior_context is not None:
+            kwargs["prior_context"] = prior_context
+            kwargs["prior_context_weight"] = float(prior_context_weight)
+        if suppress_ids:
+            kwargs["suppress_ids"] = list(suppress_ids)
 
         multi: Optional[Any] = None
         if hasattr(self.searcher, "search_multi"):
             try:
                 multi = self.searcher.search_multi(**kwargs)
             except TypeError:
+                kwargs.pop("suppress_ids", None)
+                kwargs.pop("prior_context", None)
+                kwargs.pop("prior_context_weight", None)
                 kwargs.pop("auto_policy", None)
                 kwargs.pop("relevance_floor", None)
                 kwargs.pop("active_project_sticky", None)
@@ -777,9 +832,17 @@ class MCPServer:
                     kw["relevance_floor"] = relevance_floor
                 if auto_policy:
                     kw["auto_policy"] = True
+                if prior_context is not None:
+                    kw["prior_context"] = prior_context
+                    kw["prior_context_weight"] = float(prior_context_weight)
+                if suppress_ids:
+                    kw["suppress_ids"] = list(suppress_ids)
                 try:
                     r = self.searcher.search(**kw)
                 except TypeError:
+                    kw.pop("suppress_ids", None)
+                    kw.pop("prior_context", None)
+                    kw.pop("prior_context_weight", None)
                     kw.pop("active_project_sticky", None)
                     kw.pop("relevance_floor", None)
                     kw.pop("auto_policy", None)
