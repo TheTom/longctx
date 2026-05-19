@@ -15,6 +15,7 @@ coverage.xml
 *.log
 *.json
 !pyproject.toml
+!corpora/**/*.json
 .DS_Store
 .idea/
 .vscode/
