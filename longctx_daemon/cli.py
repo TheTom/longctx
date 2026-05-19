@@ -263,14 +263,44 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     from longctx_daemon.storage.memmap_store import MemmapEmbedStore
     from longctx_daemon.storage.sqlite_store import SqliteChunkStore
 
-    corpus = Path(args.corpus_dir).expanduser().resolve()
-    if not corpus.is_dir():
-        print(f"error: --corpus-dir not a directory: {corpus}",
-              file=sys.stderr)
-        return 2
+    # ``--corpus-dir`` is repeatable. Expand each + auto-discover git
+    # worktrees off each corpus root so a single ``--corpus-dir
+    # ~/dev/foo`` extends coverage to every worktree (`/tmp/foo-a`,
+    # `~/work/foo-feat-b`, etc.) without the user enumerating them.
+    raw_corpora = args.corpus_dir
+    if isinstance(raw_corpora, str):
+        raw_corpora = [raw_corpora]
+    corpora_specs: list[tuple[str, Path]] = []
+    seen_paths: set[Path] = set()
+    for raw in raw_corpora:
+        root = Path(raw).expanduser().resolve()
+        if not root.is_dir():
+            print(f"error: --corpus-dir not a directory: {root}",
+                  file=sys.stderr)
+            return 2
+        if root in seen_paths:
+            continue
+        seen_paths.add(root)
+        corpora_specs.append((root.name, root))
+        if getattr(args, "include_worktrees", False):
+            # Worktree extension. Best-effort — never fail startup if
+            # git is missing or the dir isn't a repo.
+            for sub_name, sub_path in _discover_worktrees(root):
+                if sub_path in seen_paths:
+                    continue
+                seen_paths.add(sub_path)
+                corpora_specs.append((sub_name, sub_path))
+                print(
+                    f"[longctx serve] auto-discovered worktree: "
+                    f"{sub_name} -> {sub_path}",
+                    file=sys.stderr,
+                )
 
+    # The cache root keys on the FIRST corpus's basename so multi-root
+    # daemons get a stable cache dir tied to the primary corpus.
+    primary = corpora_specs[0][1]
     cache_dir = Path(args.cache_dir).expanduser() if args.cache_dir \
-        else Path.home() / ".cache" / "longctx" / corpus.name
+        else Path.home() / ".cache" / "longctx" / primary.name
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     # Resolve transport set. Default is stdio (preserves 2.0 contract);
@@ -325,15 +355,32 @@ def _cmd_serve(args: argparse.Namespace) -> int:
                 embedder_max_seq_length=args.max_seq_length,
             ),
         )
-        project = corpus.name
-        indexer.add_project(name=project, root_path=corpus)
-        print(f"[longctx serve] scanning {corpus} …", file=sys.stderr)
-        scan = indexer.full_scan(project)
-        print(
-            f"[longctx serve] indexed {scan.n_files:,} files, "
-            f"{scan.n_chunks_total:,} chunks in {scan.wall_secs:.1f}s",
-            file=sys.stderr,
-        )
+        # Index every (name, root) spec. Each becomes its own Project so
+        # the scope router can fan out + cross-project search works cleanly.
+        total_files = 0
+        total_chunks = 0
+        for project_name, project_root in corpora_specs:
+            indexer.add_project(name=project_name, root_path=project_root)
+            print(
+                f"[longctx serve] scanning {project_name} ({project_root}) …",
+                file=sys.stderr,
+            )
+            scan = indexer.full_scan(project_name)
+            print(
+                f"[longctx serve] indexed {scan.n_files:,} files, "
+                f"{scan.n_chunks_total:,} chunks in {scan.wall_secs:.1f}s "
+                f"({project_name})",
+                file=sys.stderr,
+            )
+            total_files += scan.n_files
+            total_chunks += scan.n_chunks_total
+        if len(corpora_specs) > 1:
+            print(
+                f"[longctx serve] all corpora ready: "
+                f"{total_files:,} files / {total_chunks:,} chunks across "
+                f"{len(corpora_specs)} projects",
+                file=sys.stderr,
+            )
 
         searcher = Searcher(
             chunk_store=chunk_store,
@@ -408,6 +455,65 @@ def _cmd_serve(args: argparse.Namespace) -> int:
             _run_in_process, log_dir=cache_dir / "logs",
         )
     return _run_in_process()
+
+
+def _discover_worktrees(root: Path) -> list[tuple[str, Path]]:
+    """Enumerate git worktrees rooted at ``root`` (best-effort).
+
+    Returns a list of (project_name, worktree_path) for every worktree
+    EXCEPT the one at ``root`` itself (caller already includes that).
+    Each worktree gets a name of the form ``<root.name>@<suffix>`` where
+    suffix is the worktree's branch name when available, else the
+    worktree path's basename. The leading ``refs/heads/`` prefix on
+    branch names is stripped.
+
+    Returns ``[]`` on any failure — `git` missing, not a repo, parse
+    error, missing worktree paths. Worktree discovery is a nice-to-have;
+    a corpus that's not a git repo (or whose git binary is missing)
+    still gets indexed as just its root path.
+
+    Format reference: ``git worktree list --porcelain`` emits blank-
+    line-separated records, each with lines like::
+
+        worktree /path
+        HEAD <sha>
+        branch refs/heads/feat/x
+    """
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "worktree", "list", "--porcelain"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return []
+    if proc.returncode != 0:
+        return []
+
+    out: list[tuple[str, Path]] = []
+    current_path: Optional[Path] = None
+    current_branch: Optional[str] = None
+    for line in proc.stdout.splitlines() + [""]:
+        if line.startswith("worktree "):
+            current_path = Path(line[len("worktree "):]).resolve()
+            current_branch = None
+        elif line.startswith("branch "):
+            ref = line[len("branch "):].strip()
+            current_branch = ref.removeprefix("refs/heads/")
+        elif not line.strip():
+            # Record terminator.
+            if current_path is not None and current_path != root:
+                if current_path.is_dir():
+                    suffix = (
+                        current_branch.replace("/", "-")
+                        if current_branch else current_path.name
+                    )
+                    name = f"{root.name}@{suffix}"
+                    out.append((name, current_path))
+            current_path = None
+            current_branch = None
+    return out
 
 
 def _mcpserver_accepts_embed_store() -> bool:
@@ -1298,8 +1404,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     serve.add_argument(
-        "--corpus-dir", required=True,
-        help="Directory to index + serve.",
+        "--corpus-dir", required=True, action="append",
+        help="Directory to index + serve. Repeat the flag to cover multiple "
+             "roots (e.g. main repo + a sibling git worktree + an unrelated "
+             "project). Each root becomes its own Project so cross-project "
+             "scope routing + fanout works.",
+    )
+    serve.add_argument(
+        "--include-worktrees", action="store_true", default=False,
+        help="For each corpus root that IS a git repo, also auto-index every "
+             "worktree of that repo as its own Project named "
+             "``<corpus>@<branch>``. Off by default because worktrees of "
+             "the same repo share most files and indexing all of them "
+             "duplicates storage. Useful when each branch has meaningfully "
+             "diverged code you want retrievable.",
     )
     serve.add_argument("--cache-dir",
                        help="Persistent index location "
