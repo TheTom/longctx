@@ -20,6 +20,7 @@ import os
 import signal
 import sys
 import textwrap
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
@@ -382,6 +383,38 @@ def _cmd_serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
+        # File-system watcher: drives live re-indexing on FS events so
+        # the daemon catches new / modified / deleted files without a
+        # restart. The Watcher class is asyncio-based; the Daemon
+        # orchestrator (below) runs it inside its TaskGroup. Best-effort
+        # — failure to construct doesn't block daemon startup; we just
+        # fall back to "no live updates" with a stderr warning.
+        fs_watcher = None
+        try:
+            from longctx_daemon.types import Project as _ProjectT
+            from longctx_daemon.watcher import Watcher, WatcherConfig
+            fs_watcher = Watcher(
+                indexer=indexer,
+                chunk_store=chunk_store,
+                config=WatcherConfig(),
+            )
+            for project_name, project_root in corpora_specs:
+                fs_watcher.add_project(_ProjectT(
+                    name=project_name, root_path=str(project_root),
+                ))
+            print(
+                f"[longctx serve] fs watcher armed for "
+                f"{len(corpora_specs)} project(s)",
+                file=sys.stderr,
+            )
+        except Exception as e:  # noqa: BLE001
+            print(
+                f"[longctx serve] fs watcher disabled: {e!r} — "
+                f"daemon will run without live re-indexing",
+                file=sys.stderr,
+            )
+            fs_watcher = None
+
         searcher = Searcher(
             chunk_store=chunk_store,
             embed_store=embed_store,
@@ -435,6 +468,7 @@ def _cmd_serve(args: argparse.Namespace) -> int:
             embed_store=embed_store,
             indexer=indexer,
             searcher=searcher,
+            watcher=fs_watcher,
         )
         print(
             f"[longctx serve] daemon starting on {host}:{mcp_port} "
@@ -1231,7 +1265,14 @@ def _cmd_reload(args: argparse.Namespace) -> int:
 
 
 def _cmd_stop(args: argparse.Namespace) -> int:
-    """Send SIGTERM to the running daemon."""
+    """Stop the running daemon: SIGTERM, wait, SIGKILL fallback.
+
+    Earlier behavior was fire-and-forget SIGTERM, which left stale
+    server.info + server.lock when uvicorn hung on long-lived SSE
+    connections. The new behavior polls the PID for up to ``--timeout``
+    seconds (default 8) and force-kills on expiry, then sweeps the
+    stale lock + info files so the next ``serve`` starts cleanly.
+    """
     info, info_path = _read_running_info(args)
     if info is None:
         print(
@@ -1246,6 +1287,8 @@ def _cmd_stop(args: argparse.Namespace) -> int:
         print(
             f"error: pid {info.pid} from server.info is gone", file=sys.stderr,
         )
+        # Process gone but stale info file — clean up.
+        _sweep_stale_daemon_files(info_path)
         return 3
     except PermissionError:
         print(
@@ -1254,7 +1297,48 @@ def _cmd_stop(args: argparse.Namespace) -> int:
         )
         return 3
     print(f"sent SIGTERM to longctx daemon (pid {info.pid})")
+
+    # Wait for graceful exit, then SIGKILL fallback.
+    timeout = float(getattr(args, "timeout", None) or 8.0)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(info.pid, 0)  # liveness probe
+        except ProcessLookupError:
+            print(f"daemon (pid {info.pid}) exited cleanly")
+            _sweep_stale_daemon_files(info_path)
+            return 0
+        time.sleep(0.25)
+
+    # Grace expired — force kill.
+    try:
+        os.kill(info.pid, signal.SIGKILL)
+        print(
+            f"daemon (pid {info.pid}) did not exit within {timeout:.0f}s — "
+            f"sent SIGKILL",
+            file=sys.stderr,
+        )
+    except ProcessLookupError:
+        # Raced — exited between the loop and here.
+        pass
+    _sweep_stale_daemon_files(info_path)
     return 0
+
+
+def _sweep_stale_daemon_files(info_path: Path) -> None:
+    """Remove server.info + server.lock siblings on exit.
+
+    The Daemon's own ``stack.callback`` chain handles this on a clean
+    asyncio teardown, but if the process was SIGKILLed (or hung past
+    grace), the callbacks never ran. Best-effort sweep so the next
+    ``serve --daemon`` doesn't trip the lock-still-held check.
+    """
+    info_path = Path(info_path)
+    for p in (info_path, info_path.with_name("server.lock")):
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _cmd_mcp_stdio(args: argparse.Namespace) -> int:
@@ -1626,11 +1710,15 @@ def build_parser() -> argparse.ArgumentParser:
     # --- stop
     stop_p = sub.add_parser(
         "stop",
-        help="Send SIGTERM to the running daemon (graceful shutdown).",
+        help="Stop the running daemon: SIGTERM, wait, SIGKILL fallback.",
     )
     stop_p.add_argument(
         "--server-info", default=None,
         help="Override server.info path (test hook).",
+    )
+    stop_p.add_argument(
+        "--timeout", type=float, default=8.0,
+        help="Seconds to wait for graceful exit before SIGKILL (default 8).",
     )
     stop_p.set_defaults(func=_cmd_stop)
 

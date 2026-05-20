@@ -107,6 +107,7 @@ class Daemon:
         embed_store: Any = None,
         indexer: Any = None,
         searcher: Any = None,
+        watcher: Any = None,
         on_reload: Optional[Callable[[], Awaitable[None]]] = None,
         on_reindex: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> None:
@@ -132,6 +133,7 @@ class Daemon:
         self.embed_store = embed_store
         self.indexer = indexer
         self.searcher = searcher
+        self.watcher = watcher
         self._on_reload = on_reload
         self._on_reindex = on_reindex
 
@@ -285,8 +287,15 @@ class Daemon:
                 await srv.serve(sockets=[mcp_sock])
             except asyncio.CancelledError:
                 # Trigger uvicorn's graceful shutdown if we were
-                # cancelled mid-serve.
+                # cancelled mid-serve. ``force_exit`` is ALSO set so
+                # long-lived SSE connections (Claude Code MCP bridge,
+                # etc.) don't block the shutdown indefinitely — they
+                # get closed instead of waited on. Without this the
+                # daemon would hang for the full grace timeout every
+                # SIGTERM and leave stale server.info / server.lock
+                # behind (observed 2026-05-19).
                 srv.should_exit = True
+                srv.force_exit = True
                 raise
 
         async def _stdio_runner() -> None:
@@ -324,6 +333,31 @@ class Daemon:
                             f"[longctx daemon] reindex failed: {e!r}\n"
                         )
 
+        async def _fs_watcher_runner() -> None:
+            # File-system change watcher. Drives live re-indexing so the
+            # daemon picks up new / modified / deleted files without a
+            # restart. Optional — if no watcher was constructed (test
+            # harnesses, ask-mode, etc.), this task no-ops cleanly.
+            if self.watcher is None:
+                return
+            try:
+                await self.watcher.run()
+            except asyncio.CancelledError:
+                # Shutdown path: signal the watcher to stop so it cancels
+                # its per-project tasks before the TaskGroup tears down.
+                try:
+                    self.watcher.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
+            except Exception as e:  # noqa: BLE001
+                # Watcher crash must not bring down the daemon — log and
+                # exit this task. Indexer stays usable; only live updates
+                # stop working until a restart.
+                sys.stderr.write(
+                    f"[longctx daemon] fs watcher crashed: {e!r}\n"
+                )
+
         # Run everything under one task group. CancelledError from the
         # shutdown watcher cancels the group; we catch the resulting
         # ExceptionGroup at the boundary.
@@ -333,6 +367,7 @@ class Daemon:
                 tg.create_task(_stdio_runner(), name="longctx-stdio")
                 tg.create_task(_reload_watcher(), name="longctx-reload")
                 tg.create_task(_reindex_watcher(), name="longctx-reindex")
+                tg.create_task(_fs_watcher_runner(), name="longctx-fs-watcher")
                 tg.create_task(_shutdown_watcher(), name="longctx-shutdown")
         except* asyncio.CancelledError:
             # Expected — shutdown_watcher fired or transports were cancelled.

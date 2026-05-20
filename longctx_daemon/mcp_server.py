@@ -41,7 +41,7 @@ from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
@@ -157,6 +157,16 @@ _SEARCH_CODEBASE_DOC = (
     "  scope_decision: which project(s) the search hit and why\n"
     "    (cwd / sticky / explicit / fanout). Surface this if results\n"
     "    came from an unexpected project.\n"
+    "  suggested_followup: present ONLY when the server detected a\n"
+    "    pattern that warrants a follow-up call. Two shapes:\n"
+    "      { action: 'suppress_ids', values: [int, int, ...],\n"
+    "        reason: '<why>' }\n"
+    "      { action: 'prior_context', reason: '<why>' }\n"
+    "    When present, the server is telling you the iterative-\n"
+    "    retrieval path is the right next step — pass the named\n"
+    "    kwarg on your next call. Honor the hint when your task\n"
+    "    isn't already answered by the chunks you got; ignore it\n"
+    "    when you already have what you need.\n"
     "\n"
     "WHAT THIS TOOL DOES NOT RETURN:\n"
     "  * The raw whole file (chunks are line-range slices — use Read\n"
@@ -659,6 +669,13 @@ class ConnectionContext:
     active_project_sticky: Optional[str] = None
     client_name: str = "unknown"
     client_version: str = "unknown"
+    # Iterative-retrieval hint state. Last N search_codebase calls'
+    # (query, returned_chunk_ids) tuples — used to spot recurring
+    # chunks across queries and surface a `suggested_followup` field
+    # on the next response so the agent reaches for `suppress_ids`
+    # without having to plan it cold. Capped at ~16 entries to keep
+    # memory bounded; FIFO eviction.
+    recent_searches: list[tuple[str, tuple[int, ...]]] = field(default_factory=list)
 
 
 # Per-task active connection. Transports set this in their accept-loop
@@ -1088,6 +1105,36 @@ class MCPServer:
             ),
         }
 
+        # Iterative-retrieval hint. The description rewrite (commit
+        # d0b74ee) named suppress_ids / prior_context with explicit
+        # "USE WHEN" triggers, but a full day of real-agent traces
+        # showed 0/30 organic kwarg use. Descriptions teach standalone
+        # tools well; retry-time kwargs need a per-response nudge.
+        # Surface a `suggested_followup` field when the response shape
+        # strongly suggests an iterative retry would help.
+        if isinstance(query, str):
+            current_ids = tuple(
+                int(c["chunk_id"])
+                for c in kept_chunks
+                if c.get("chunk_id") is not None
+            )
+            ctx = self._session_state()
+            followup = _build_suggested_followup(
+                current_query=query,
+                current_chunk_ids=current_ids,
+                current_quality=response["retrieval_quality"],
+                no_relevant_results=response["no_relevant_results"],
+                recent_searches=ctx.recent_searches,
+            )
+            if followup is not None:
+                response["suggested_followup"] = followup
+            # Record this call for the next round's analysis. FIFO-cap
+            # at 16 entries — enough to spot recurring chunks across a
+            # multi-turn session, small enough to keep memory bounded.
+            ctx.recent_searches.append((query, current_ids))
+            if len(ctx.recent_searches) > 16:
+                ctx.recent_searches.pop(0)
+
         scope_dict = response["scope_decision"]
         latency_dict = _dataclass_to_flat_dict(result.latency_ms)
 
@@ -1105,6 +1152,10 @@ class MCPServer:
             "top1_dense_cosine": response["top1_dense_cosine"],
             "query_type": response["query_type"],
         }
+        if "suggested_followup" in response:
+            summary["suggested_followup_action"] = response[
+                "suggested_followup"
+            ].get("action")
         return response, scope_dict, latency_dict, summary
 
     async def _handle_search_codebase_multi(
@@ -1844,6 +1895,82 @@ def _search_chunk_to_dict(sc) -> dict[str, Any]:
     if cid is not None:
         out["chunk_id"] = int(cid)
     return out
+
+
+def _build_suggested_followup(
+    *,
+    current_query: str,
+    current_chunk_ids: tuple[int, ...],
+    current_quality: str,
+    no_relevant_results: bool,
+    recent_searches: Sequence[tuple[str, tuple[int, ...]]],
+) -> Optional[dict[str, Any]]:
+    """Decide whether to emit a ``suggested_followup`` hint on this response.
+
+    The MCP tool description (commit d0b74ee) names suppress_ids /
+    prior_context with explicit triggers, but real agent traces show
+    descriptions alone don't drive multi-step kwarg use. This helper
+    surfaces a structured hint on the response itself — agents
+    respond to per-response fields far more reliably than to prose.
+
+    Two rules fire (in priority order):
+
+    1. ``no_relevant_results=true`` → suggest ``prior_context`` retry.
+       Tell the agent that refining with what they already know
+       (error trace, prior observation) is the right next step.
+
+    2. Recurring chunk_id across the session's recent searches AND
+       this call's quality is medium/low → suggest ``suppress_ids``
+       so the next call surfaces alternatives. We require the
+       repeated chunk to appear in BOTH this call and at least one
+       earlier call to keep the signal precise (random one-shot hits
+       shouldn't trigger).
+
+    Returns ``None`` when no rule fires — agents that don't read the
+    field aren't affected; agents that do see exactly one structured
+    hint per call where it matters.
+    """
+    if no_relevant_results:
+        return {
+            "action": "prior_context",
+            "reason": (
+                "Top-1 dense cosine below the relevance floor — corpus "
+                "had nothing strong for this query. If you have an "
+                "error trace, partial fix, or refined understanding, "
+                "retry with prior_context=<that text> and "
+                "prior_context_weight=0.3 to bias retrieval toward "
+                "what you've learned."
+            ),
+        }
+    if current_quality not in {"medium", "low"}:
+        return None
+    if not current_chunk_ids or not recent_searches:
+        return None
+    # Recurring chunk detection: any chunk_id that appears in this
+    # call AND at least one prior call this session.
+    current_set = set(current_chunk_ids)
+    recurring = [
+        cid
+        for cid in current_chunk_ids
+        if any(cid in prior_ids for _, prior_ids in recent_searches)
+    ]
+    if not recurring:
+        return None
+    # Build the suppress list: current top-K (the chunks the agent is
+    # about to see again) — passing these on the next call surfaces
+    # new chunks below them.
+    suppress_ids = sorted(set(int(c) for c in current_chunk_ids))
+    return {
+        "action": "suppress_ids",
+        "values": suppress_ids,
+        "reason": (
+            f"chunk_id {recurring[0]} has already appeared in an "
+            f"earlier search this session. Pass "
+            f"suppress_ids={suppress_ids} on the next search_codebase "
+            f"call to surface different chunks. Cheaper than "
+            f"re-querying with new keywords."
+        ),
+    }
 
 
 def _dataclass_to_flat_dict(obj: Any) -> dict[str, Any]:

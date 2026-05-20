@@ -175,12 +175,25 @@ def test_stop_no_daemon(tmp_path):
 
 
 def test_stop_sends_sigterm(tmp_path, capsys, monkeypatch):
+    """SIGTERM lands; if process appears to exit (fake_kill(0) raises
+    ProcessLookupError on the liveness probe), SIGKILL is NOT sent."""
     info_path = _write_fake_info(tmp_path)
     sent: list[tuple[int, int]] = []
 
+    # Simulate the daemon exiting cleanly after the SIGTERM by raising
+    # ProcessLookupError on the liveness probe (signal 0). The fake
+    # records SIGTERM, then signal-0 probes raise to indicate "gone".
+    state = {"alive": True}
+
     def fake_kill(pid, sig):
-        if sig != 0:
-            sent.append((pid, sig))
+        if sig == 0:
+            # Liveness probe — first probe sees gone (clean exit).
+            if not state["alive"]:
+                raise ProcessLookupError
+            return
+        sent.append((pid, sig))
+        # After SIGTERM, mark the process as gone so the wait loop exits.
+        state["alive"] = False
 
     monkeypatch.setattr("longctx_daemon.cli.os.kill", fake_kill)
     monkeypatch.setattr(
@@ -189,6 +202,33 @@ def test_stop_sends_sigterm(tmp_path, capsys, monkeypatch):
     rc = cli.main(["stop", "--server-info", str(info_path)])
     assert rc == 0
     assert sent == [(os.getpid(), signal.SIGTERM)]
+
+
+def test_stop_sigkills_when_grace_expires(tmp_path, monkeypatch):
+    """When the daemon ignores SIGTERM (liveness probe keeps returning
+    alive), the stop command escalates to SIGKILL after the timeout."""
+    info_path = _write_fake_info(tmp_path)
+    sent: list[tuple[int, int]] = []
+
+    def fake_kill(pid, sig):
+        # Signal 0 = liveness probe; always alive in this scenario.
+        if sig == 0:
+            return
+        sent.append((pid, sig))
+
+    monkeypatch.setattr("longctx_daemon.cli.os.kill", fake_kill)
+    monkeypatch.setattr(
+        "longctx_daemon.server_info.os.kill", fake_kill,
+    )
+    monkeypatch.setattr("longctx_daemon.cli.time.sleep", lambda _: None)
+    rc = cli.main([
+        "stop", "--server-info", str(info_path), "--timeout", "0.5",
+    ])
+    assert rc == 0
+    assert sent == [
+        (os.getpid(), signal.SIGTERM),
+        (os.getpid(), signal.SIGKILL),
+    ]
 
 
 def test_stop_permission_denied(tmp_path, monkeypatch):

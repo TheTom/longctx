@@ -688,3 +688,62 @@ class TestEndToEnd:
         assert resp.isError is False
         # 100 tokens < 120 of first chunk → keeps 1 (always-at-least-one).
         assert len(resp.structuredContent["chunks"]) == 1
+
+
+# -------------------------- suggested_followup hint helper
+
+def test_suggested_followup_no_relevant_results_suggests_prior_context():
+    from longctx_daemon.mcp_server import _build_suggested_followup
+    hint = _build_suggested_followup(
+        current_query="anything",
+        current_chunk_ids=(),
+        current_quality="abstain",
+        no_relevant_results=True,
+        recent_searches=[],
+    )
+    assert hint is not None
+    assert hint["action"] == "prior_context"
+    assert "prior_context" in hint["reason"]
+
+
+def test_suggested_followup_recurring_chunk_suggests_suppress_ids():
+    from longctx_daemon.mcp_server import _build_suggested_followup
+    # Earlier query returned chunk 42; current query returns it again.
+    hint = _build_suggested_followup(
+        current_query="round 2",
+        current_chunk_ids=(42, 99),
+        current_quality="medium",
+        no_relevant_results=False,
+        recent_searches=[("round 1", (42, 7))],
+    )
+    assert hint is not None
+    assert hint["action"] == "suppress_ids"
+    assert 42 in hint["values"]
+    assert 99 in hint["values"]
+
+
+def test_suggested_followup_silent_on_clean_first_shot():
+    """High-quality first-shot with no recurring chunks → no hint
+    (agent has what it needs; don't nag)."""
+    from longctx_daemon.mcp_server import _build_suggested_followup
+    hint = _build_suggested_followup(
+        current_query="clean query",
+        current_chunk_ids=(1, 2, 3),
+        current_quality="high",
+        no_relevant_results=False,
+        recent_searches=[("prior", (99, 100))],
+    )
+    assert hint is None
+
+
+def test_suggested_followup_silent_on_medium_quality_no_recurring():
+    """Medium quality but no recurring chunks → no hint."""
+    from longctx_daemon.mcp_server import _build_suggested_followup
+    hint = _build_suggested_followup(
+        current_query="fresh angle",
+        current_chunk_ids=(10, 20),
+        current_quality="medium",
+        no_relevant_results=False,
+        recent_searches=[("earlier", (50, 60))],
+    )
+    assert hint is None
