@@ -36,6 +36,7 @@ wires them up. The contract is:
 from __future__ import annotations
 
 import asyncio
+import sys
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, is_dataclass, replace
 from datetime import datetime, timezone
@@ -676,6 +677,13 @@ class ConnectionContext:
     # without having to plan it cold. Capped at ~16 entries to keep
     # memory bounded; FIFO eviction.
     recent_searches: list[tuple[str, tuple[int, ...]]] = field(default_factory=list)
+    # Ambient learning (PRD 2026-05-21 Phase 1). Tracks which repo
+    # roots the agent has touched via ``cwd`` arg in THIS session.
+    # First touch of an unindexed repo kicks off background indexing
+    # so the next search call in that repo returns real chunks. Set
+    # contains absolute resolved root paths (see
+    # ``auto_learn.resolve_repo_root``).
+    touched_repos_this_session: set[str] = field(default_factory=set)
 
 
 # Per-task active connection. Transports set this in their accept-loop
@@ -997,6 +1005,13 @@ class MCPServer:
         prior_context_weight = args.get("prior_context_weight", 0.3)
         suppress_ids = args.get("suppress_ids")
 
+        # Ambient learning: if the agent's cwd points to a repo we
+        # haven't seen, register it and kick off background indexing
+        # so the next search call in the same repo returns real
+        # chunks. Returns a hint dict on first touch, None otherwise.
+        # See ``_maybe_auto_learn_cwd`` for the decision rules.
+        ambient_signal = self._maybe_auto_learn_cwd(cwd)
+
         # Sticky session: when caller didn't pass project= or cwd, use
         # the session's set_active_project value (PRD §3.4 / §3.9). The
         # searcher's scope-decision tier 3 (active_project_sticky) does
@@ -1135,6 +1150,13 @@ class MCPServer:
             if len(ctx.recent_searches) > 16:
                 ctx.recent_searches.pop(0)
 
+        # Surface the ambient-learning signal on the response so
+        # the agent (and any human inspecting the trace) knows a
+        # new project was registered + indexing kicked off behind
+        # the scenes. PRD 2026-05-21 Phase 1.
+        if ambient_signal is not None:
+            response["learning_signal"] = ambient_signal
+
         scope_dict = response["scope_decision"]
         latency_dict = _dataclass_to_flat_dict(result.latency_ms)
 
@@ -1156,6 +1178,8 @@ class MCPServer:
             summary["suggested_followup_action"] = response[
                 "suggested_followup"
             ].get("action")
+        if ambient_signal is not None:
+            summary["learning_signal_project"] = ambient_signal["project"]
         return response, scope_dict, latency_dict, summary
 
     async def _handle_search_codebase_multi(
@@ -1728,6 +1752,102 @@ class MCPServer:
             return frozenset(cfg.forbidden_dirs)
         # Last-resort default mirrors indexer.DEFAULT_FORBIDDEN_DIRS.
         return frozenset({"secrets", "credentials", ".aws", ".ssh", ".gnupg"})
+
+    def _maybe_auto_learn_cwd(
+        self, cwd: Optional[str],
+    ) -> Optional[dict[str, Any]]:
+        """Ambient learning hook (PRD 2026-05-21 Phase 1).
+
+        Called early in every ``search_codebase`` handler. Decides
+        whether the agent's ``cwd`` arg points to a repo the daemon
+        should auto-register for indexing.
+
+        Decision rules (per Tom's PRD review choices):
+          * ``LONGCTX_AUTO_LEARN=0`` → disabled, returns None
+          * cwd is None/empty/forbidden → returns None
+          * cwd resolves to a repo already registered → returns None
+            (existing project; the watcher already covers updates)
+          * cwd resolves to an unseen repo + first touch this
+            session (Q2=A: single-touch threshold) → registers
+            the project, kicks off background full_scan, returns
+            a ``{project, root_path, status}`` dict so the
+            response can surface a ``learning_signal`` field
+
+        The bookkeeping of "touched this session" lives on the
+        per-connection ``ConnectionContext`` so SSE/stdio sessions
+        learn independently and the daemon doesn't double-add the
+        same repo on every search call in a session.
+        """
+        from longctx_daemon import auto_learn
+
+        if not auto_learn.ambient_learning_enabled():
+            return None
+        root = auto_learn.resolve_repo_root(cwd)
+        if root is None:
+            return None
+        ctx = self._session_state()
+        if root in ctx.touched_repos_this_session:
+            # Already noted this session; nothing new to do.
+            return None
+        ctx.touched_repos_this_session.add(root)
+
+        # Already registered? Skip — the existing project's watcher
+        # handles future updates. Per-name lookup is fine because
+        # we derive the same name from the same root path.
+        name = auto_learn.project_name_from_root(root)
+        try:
+            existing = self.chunk_store.get_project(name)
+        except Exception:  # noqa: BLE001
+            existing = None
+        if existing is not None:
+            return None
+
+        # Register + kick off background indexing. Errors here go
+        # to stderr but never break the search call.
+        try:
+            self.indexer.add_project(name=name, root_path=Path(root))
+        except Exception as exc:  # noqa: BLE001
+            sys.stderr.write(
+                f"[longctx ambient] add_project failed for {root}: {exc!r}\n"
+            )
+            return None
+
+        # Stamp as session-bound: ambient learning defaults to
+        # ``persist=False`` so the registry doesn't accumulate
+        # one-off cwd hits across restarts. Phase 2 of the PRD
+        # adds the tier-based persistence model.
+        session_id = ctx.session_id
+        try:
+            from dataclasses import replace as _replace
+            project_obj = self.chunk_store.get_project(name)
+            if project_obj is not None and project_obj.session_id != session_id:
+                self.chunk_store.upsert_project(
+                    _replace(project_obj, session_id=session_id),
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Tell the watcher (if attached) about the new project so
+        # FS events flow once indexing completes.
+        if self._watcher is not None:
+            try:
+                from longctx_daemon.types import Project as _ProjectT
+                self._watcher.add_project(_ProjectT(
+                    name=name, root_path=root,
+                ))
+            except Exception as exc:  # noqa: BLE001
+                sys.stderr.write(
+                    f"[longctx ambient] watcher.add_project failed "
+                    f"for {root}: {exc!r}\n"
+                )
+
+        self._launch_full_scan(name)
+        return {
+            "project": name,
+            "root_path": root,
+            "status": "indexing",
+            "trigger": "cwd-auto-learn",
+        }
 
     def _launch_full_scan(self, project: str) -> None:
         """Schedule an indexer.full_scan in the background.

@@ -269,6 +269,55 @@ The rescue path **only auto-fires through ``ChatSession``**. Bare
 
 ---
 
+## How longctx helps tool-use
+
+longctx helped tool-use in two distinct ways during the overnight
+2026-05-11 → 2026-05-12 Hermes-on-vllm-swift bench, one expected and
+one surprising.
+
+### 1. Expected — relevant code is injected without burning context
+
+The standard story: retriever finds top-K chunks for the current turn's
+query, splices them into the system message. The model then has the
+right code in front of it when deciding which tool to call. Saves the
+agent from having to ``read_file`` every file just to see what's there.
+
+### 2. Surprising — longctx is load-bearing for Hermes' agentic flow itself
+
+This came out of overnight Test 4 (``--max-model-len 65536`` but
+``--enable-longctx`` **off**):
+
+- Hermes started, sent ONE prompt to vllm-swift.
+- Model emitted a friendly text response: *"Let me read the prompt file
+  first."*
+- Zero tool calls in that response.
+- Hermes' agent loop saw 0 tool calls → terminated cleanly after 24
+  seconds.
+- Test directory stayed empty.
+
+With longctx ON (Tests 1, 2, 3 — same prompt, same model, same
+everything else), the model immediately emitted tool calls and started
+building files.
+
+The mechanism appears to be: longctx's chunk splice changes the shape
+of the system context the model sees. Without that splice, the system
+prompt is shorter and the model defaults to conversational mode —
+*"I'll read it then tell you what I find."* With splice, the system
+message contains code-block fenced chunks, which primes the model to
+operate in *"I'm in a codebase, I should use tools"* mode and emit a
+``read_file`` or ``write_file`` tool call instead.
+
+So longctx isn't just retrieval — for at least Hermes on
+Qwen3.6-27B-ConfigI, it's a **behavioral primer** that flips the model
+from chat-mode into agent-mode. Without it, the tool-call rate drops
+dramatically and the agentic loop terminates.
+
+This was the night's biggest unexpected finding. Practical implication:
+for the stack we ship, benchmarking the model + harness without
+longctx measures a different system than what end users experience.
+
+---
+
 ## Tuning knobs
 
 All knobs are env vars (so the engine sidecar can inherit them without code
@@ -286,6 +335,61 @@ path.
 | ``LONGCTX_TS`` | ``0`` | Tree-sitter chunker (Python / TS / JS / Go / Rust). Off by default — line-window chunking is the production path. |
 | ``LONGCTX_CACHE_DIR`` | ``~/.longctx`` | Where indices live. |
 | ``LONGCTX_ENDPOINT`` | unset | V3 rescue mode — point engines at a running longctx-svc. |
+| ``LONGCTX_AUTO_LEARN`` | ``1`` | Ambient learning — daemon auto-registers repos when the agent's ``cwd`` arg points to one. Set ``0`` to disable. See [Ambient Learning](#ambient-learning) below. |
+
+---
+
+## Ambient Learning
+
+Starting with v0.3.4 (2026-05-21), the daemon **learns** which repos to index by
+watching the ``cwd`` arg on every ``search_codebase`` MCP call. No upfront
+``--corpus-dir`` setup, no filesystem walk on startup, no per-user config of
+"where my code lives." The daemon converges to the user's real working set as
+the agent uses it.
+
+**How it works:**
+
+1. Agent calls ``search_codebase(query="...", cwd="/Users/tom/dev/myrepo")``.
+2. Daemon resolves ``cwd`` to a repo root (walks up looking for ``.git``; uses
+   ``cwd`` itself if no git ancestor).
+3. If that root isn't already a registered project AND isn't under a forbidden
+   parent (see below), the daemon registers it as a session-bound project and
+   kicks off a background ``full_scan``.
+4. The response carries a ``learning_signal`` field telling the caller the new
+   project is being indexed.
+5. The next search call against the same repo returns real chunks.
+
+**Default-on.** Disable with ``LONGCTX_AUTO_LEARN=0``.
+
+**Forbidden parents** — the daemon will NEVER auto-index paths under any of
+these, even if the agent's ``cwd`` points there. Explicit ``--corpus-dir`` and
+the ``add_project`` MCP tool keep working for any directory the user chooses.
+
+```
+~/.ssh
+~/.aws
+~/.gnupg
+~/Library
+~/Downloads
+~/.Trash
+~/Desktop
+/private/var
+/tmp
+/private/tmp
+```
+
+Plus bare ``/`` and ``~`` if the agent literally passes one of those.
+
+**Coexists with explicit ``--corpus-dir``.** Both signal channels add to the
+same registry. A repo registered by ambient learning lives alongside any
+explicitly-added corpora.
+
+**Session scope.** Ambient-registered projects default to ``persist=False``
+(session-bound) in v0.3.4. Phase 2 of the [Ambient Indexing PRD] adds the
+cross-session tier model where actively-touched repos persist across daemon
+restarts.
+
+[Ambient Indexing PRD]: https://github.com/TheTom/longctx/blob/main/docs/PRD-ambient-indexing.md
 
 ---
 

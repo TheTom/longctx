@@ -747,3 +747,169 @@ def test_suggested_followup_silent_on_medium_quality_no_recurring():
         recent_searches=[("earlier", (50, 60))],
     )
     assert hint is None
+
+
+# ============================================================ ambient learning
+
+
+class _FakeIndexerWithAdd:
+    """Indexer fake that supports add_project + full_scan for ambient-
+    learning integration tests. Records every add for assertion."""
+
+    def __init__(self):
+        self.added: list[tuple[str, str]] = []  # (name, root_path)
+        self.scanned: list[str] = []
+        self.status_value = _make_index_status()
+
+    def add_project(self, *, name, root_path):
+        self.added.append((name, str(root_path)))
+        from longctx_daemon.types import Project as _ProjectT
+        return _ProjectT(name=name, root_path=str(root_path))
+
+    def full_scan(self, project):
+        self.scanned.append(project)
+        return None  # ScanResult unused in this path
+
+    def status(self):
+        return self.status_value
+
+
+def test_ambient_learning_registers_new_repo_on_first_cwd_touch(
+    tmp_path, monkeypatch,
+):
+    """First search_codebase call with a cwd in an unseen repo
+    triggers indexer.add_project + full_scan and surfaces a
+    learning_signal on the response."""
+    # /tmp/ subtree is forbidden by default; relax for this test only.
+    from longctx_daemon import auto_learn as _al
+    monkeypatch.setattr(
+        _al, "FORBIDDEN_PARENTS",
+        tuple(p for p in _al.FORBIDDEN_PARENTS
+              if not p.startswith("/tmp")
+              and not p.startswith("/private/tmp")
+              and p != "/private/var"),
+    )
+
+    repo = tmp_path / "fakeproj"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+
+    indexer = _FakeIndexerWithAdd()
+    server = _make_server(indexer=indexer)
+
+    out = asyncio.run(server._dispatch_tool(
+        "search_codebase",
+        {"query": "hello", "cwd": str(repo)},
+    ))
+
+    # Indexer was told to add the new project + kick off full_scan.
+    assert indexer.added, f"expected add_project; got {indexer.added}"
+    name, root = indexer.added[0]
+    assert root == str(repo.resolve())
+    # Response carries the learning_signal field.
+    sig = out.get("learning_signal")
+    assert sig is not None, f"missing learning_signal in {out.keys()}"
+    assert sig["project"] == name
+    assert sig["status"] == "indexing"
+    assert sig["trigger"] == "cwd-auto-learn"
+
+
+def test_ambient_learning_skips_already_indexed_repo(tmp_path, monkeypatch):
+    """If the cwd's repo is already in chunk_store, no add_project
+    call fires + no learning_signal in response."""
+    from longctx_daemon import auto_learn as _al
+    monkeypatch.setattr(
+        _al, "FORBIDDEN_PARENTS",
+        tuple(p for p in _al.FORBIDDEN_PARENTS
+              if not p.startswith("/tmp")
+              and not p.startswith("/private/tmp")
+              and p != "/private/var"),
+    )
+
+    repo = tmp_path / "knownproj"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+
+    from longctx_daemon.types import Project as _ProjectT
+    chunk_store = FakeChunkStore(projects=(
+        _ProjectT(name="knownproj", root_path=str(repo.resolve())),
+    ))
+    indexer = _FakeIndexerWithAdd()
+    server = _make_server(chunk_store=chunk_store, indexer=indexer)
+
+    out = asyncio.run(server._dispatch_tool(
+        "search_codebase",
+        {"query": "hello", "cwd": str(repo)},
+    ))
+
+    assert not indexer.added, "should not re-add already-known repo"
+    assert "learning_signal" not in out
+
+
+def test_ambient_learning_disabled_via_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("LONGCTX_AUTO_LEARN", "0")
+    from longctx_daemon import auto_learn as _al
+    monkeypatch.setattr(
+        _al, "FORBIDDEN_PARENTS",
+        tuple(p for p in _al.FORBIDDEN_PARENTS
+              if not p.startswith("/tmp")
+              and not p.startswith("/private/tmp")
+              and p != "/private/var"),
+    )
+    repo = tmp_path / "ignoredproj"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+
+    indexer = _FakeIndexerWithAdd()
+    server = _make_server(indexer=indexer)
+    out = asyncio.run(server._dispatch_tool(
+        "search_codebase",
+        {"query": "hello", "cwd": str(repo)},
+    ))
+
+    assert not indexer.added
+    assert "learning_signal" not in out
+
+
+def test_ambient_learning_skips_forbidden_cwd(tmp_path, monkeypatch):
+    # Default forbidden parents — pass cwd under /tmp which IS
+    # in the forbidden list by default.
+    indexer = _FakeIndexerWithAdd()
+    server = _make_server(indexer=indexer)
+
+    out = asyncio.run(server._dispatch_tool(
+        "search_codebase",
+        {"query": "hello", "cwd": "/tmp/some-random-clone"},
+    ))
+
+    assert not indexer.added
+    assert "learning_signal" not in out
+
+
+def test_ambient_learning_dedups_within_session(tmp_path, monkeypatch):
+    """Second call with the same cwd does NOT fire add_project again
+    even though the chunk_store entry hasn't been populated yet
+    (mock indexer doesn't write to chunk_store on add)."""
+    from longctx_daemon import auto_learn as _al
+    monkeypatch.setattr(
+        _al, "FORBIDDEN_PARENTS",
+        tuple(p for p in _al.FORBIDDEN_PARENTS
+              if not p.startswith("/tmp")
+              and not p.startswith("/private/tmp")
+              and p != "/private/var"),
+    )
+    repo = tmp_path / "dedupproj"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+
+    indexer = _FakeIndexerWithAdd()
+    server = _make_server(indexer=indexer)
+
+    asyncio.run(server._dispatch_tool(
+        "search_codebase", {"query": "first", "cwd": str(repo)},
+    ))
+    asyncio.run(server._dispatch_tool(
+        "search_codebase", {"query": "second", "cwd": str(repo)},
+    ))
+
+    assert len(indexer.added) == 1, f"expected 1 add; got {indexer.added}"
