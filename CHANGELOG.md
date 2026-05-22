@@ -1,5 +1,145 @@
 # Changelog
 
+## 0.4.0 — 2026-05-22
+
+Minor release. Major new agent-side capabilities: ambient learning,
+iterative retrieval API, live filesystem watcher, multi-corpus
+daemon, and a full MCP tool description overhaul. Existing
+`--corpus-dir` workflows are backward compatible.
+
+### New: Ambient learning (default-on)
+
+The daemon now learns which repos to index by watching the agent's
+``cwd`` arg on every ``search_codebase`` MCP call. No upfront
+``--corpus-dir`` setup required for typical workflows. First touch
+of an unseen repo triggers background indexing; second search
+returns real chunks. Per-session dedup, forbidden-path defense.
+
+* Disable with ``LONGCTX_AUTO_LEARN=0`` env var.
+* Forbidden parents: ``~/.ssh``, ``~/.aws``, ``~/.gnupg``,
+  ``~/Library``, ``~/Downloads``, ``~/.Trash``, ``~/Desktop``,
+  ``/private/var``, ``/tmp``, ``/private/tmp``. Documented in
+  README "Ambient Learning" section.
+* New ``learning_signal`` response field surfaces auto-registrations
+  to the agent (and any audit trail).
+* Coexists with explicit ``--corpus-dir``; both contribute to the
+  same registry.
+
+See PRD: `docs/PRD-ambient-indexing.md` (Phase 1; Phase 2 ships
+cross-session persistence + tier model + compressed Stale tier).
+
+### New: Iterative retrieval API
+
+``Searcher.search`` + ``search_multi`` gained three kwargs for
+AutoCodeRover-style retry loops:
+
+* ``prior_context`` (str or list of strings): error traces / prior
+  queries / refined observations, mixed into the query embedding
+  at ``prior_context_weight`` (default 0.3).
+* ``suppress_ids`` (iterable of ints): chunk IDs already shown,
+  filtered from results so retries surface new evidence.
+* ``SearchChunk.chunk_id`` exposed so callers can round-trip.
+
+Surfaced over MCP on the ``search_codebase`` tool. Each search
+response carries an optional ``suggested_followup`` field
+{ action: 'suppress_ids' | 'prior_context', reason, values }
+when the server detects recurring chunks or no-relevant-results
+conditions, nudging the agent toward the right kwarg at the
+right moment.
+
+### New: Live filesystem watcher
+
+The ``Watcher`` class (already implemented in 0.3.x) is now wired
+into ``_cmd_serve``. New / modified / deleted files in any indexed
+corpus get picked up live without a daemon restart. Closes the
+"wait_for_quiescence is a lying-tool" bug; agents that write code
+and immediately search see the new files.
+
+### New: MCP tool description overhaul (Anthropic-aligned)
+
+All 7 MCP tools rewritten per Anthropic's tool-design guidance
+(platform.claude.com/.../tool-use/define-tools +
+anthropic.com/engineering/writing-tools-for-agents). Each tool now
+has:
+
+* USE WHEN block: concrete trigger scenarios
+* DO NOT USE FOR block: negative space + correct alternatives
+* PARAMETERS section with per-arg semantics
+* RESPONSE FIELDS section telling the agent what to DO with each
+  field (esp. ``retrieval_quality``, ``no_relevant_results``,
+  ``is_fully_fresh``, ``suggested_followup``)
+* WHAT THIS TOOL DOES NOT RETURN block
+
+Per-arg ``description`` on every JSONSchema property (was: missing
+on most). Agent-agnostic: works for Claude / Hermes / Codex / Pi /
+OpenCode / any MCP client.
+
+### New: Repeatable ``--corpus-dir`` + opt-in worktree discovery
+
+``longctx serve`` now accepts multiple ``--corpus-dir`` flags;
+each becomes its own Project. Plus a new ``--include-worktrees``
+flag that auto-indexes every ``git worktree list`` entry of an
+indexed git repo as ``<corpus>@<branch>``. Off by default
+(worktrees of the same repo share most files; opt-in keeps the
+user in control).
+
+### Bug fixes
+
+* **Searcher: keep at least one chunk when first hit overflows
+  max_tokens.** Previously a small ``max_tokens`` (e.g. 2000) with
+  a corpus chunked at 2048 tokens would silently return zero
+  chunks even when ``top1_dense_cosine`` was strong. Now the
+  searcher passes through the over-budget first chunk; the MCP
+  layer's downstream trim handles the budget normally.
+
+* **Daemon stop hygiene.** ``longctx stop`` now polls the PID for
+  up to ``--timeout`` seconds (default 8) and escalates to
+  ``SIGKILL`` on expiry, then sweeps stale ``server.info`` /
+  ``server.lock`` files. uvicorn ``force_exit=True`` on cancel
+  ensures long-lived SSE connections don't block shutdown
+  indefinitely. Previously SIGTERM-then-exit could leave the
+  daemon hanging on Claude Code MCP bridges.
+
+* **dedup_by_doc_root** for near-duplicate chunk collapse. Skips
+  chunks whose source file ``rel_path`` shares a doc-root key
+  with one already in the result. Required for the SWE-ZERO
+  trajectory corpus where 100 rollouts per PR produce 100 near-
+  identical embeddings.
+
+### Tests
+
+850+ → 878 daemon tests passing. New coverage:
+
+* ``test_searcher_iterative.py``: 6 unit + 1 live smoke against
+  the swezero-12m/java pack.
+* ``test_mcp_server.py``: 5 ambient-learning integration tests +
+  4 ``suggested_followup`` helper tests.
+* ``test_auto_learn.py``: 23 unit tests on the pure helpers
+  (resolve_repo_root, is_forbidden_parent, naming dedup,
+  worktree handling).
+* ``test_cli_daemon.py``: rewritten SIGTERM-only test + new
+  SIGKILL-after-grace path test.
+
+### Pack system additions
+
+* ``longctx pack {list,add,rm,info,scan}`` CLI for the new
+  ``Pack`` + ``PackRegistry`` abstraction. ``pack scan`` walks a
+  root directory (default ``~/.cache/longctx/corpora``) and
+  auto-registers every valid pack found. Idempotent — already-
+  registered packs get refreshed in place.
+* ``corpora/swezero-12m/`` ingest harness for the SWE-ZERO-12M
+  trajectories dataset; 7 per-language packs (go, python, rust,
+  javascript, typescript, java, misc).
+
+### Other
+
+* ``longctx-svc``: path-cluster scope detection + kill cwd fallback
+  for ``set_active_project``. V3 session hibernation (Tier 4 cold
+  storage).
+* Tool description for ``search_codebase`` now documents the new
+  ``learning_signal`` and ``suggested_followup`` fields so agents
+  know to read them.
+
 ## 0.3.2 — 2026-05-13
 
 Patch release. No API changes; coverage + test hardening only.

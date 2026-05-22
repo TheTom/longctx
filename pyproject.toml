@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "longctx"
-version = "0.3.2"
+version = "0.4.0"
 description = "Open long-context inference stack: retrieval + open weights, no closed parts."
 readme = "README.md"
 requires-python = ">=3.11"

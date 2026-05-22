@@ -460,10 +460,16 @@ Full curves + receipts in [`docs/results.md`](docs/results.md),
 
 ---
 
-## Features (v0.3.0–v0.3.3, all in)
+## Features (v0.3.0–v0.4.0, all in)
 
 | Feature | Status |
 |---|:-:|
+| **Ambient learning** — daemon auto-registers repos from agent's `cwd` (v0.4.0) | ✅ |
+| **Iterative retrieval API** — `suppress_ids` + `prior_context` on `search_codebase` (v0.4.0) | ✅ |
+| **`suggested_followup`** response field — server-side kwarg hints (v0.4.0) | ✅ |
+| **Live FS watcher** wired into daemon (v0.4.0) | ✅ |
+| **Multi-corpus daemon** — repeatable `--corpus-dir`, opt-in `--include-worktrees` (v0.4.0) | ✅ |
+| **MCP tool descriptions** — Anthropic-aligned USE WHEN / DO NOT / per-arg / response-action sections (v0.4.0) | ✅ |
 | Scope detection from prefill paths (absolute + relative) | ✅ |
 | Hot scope (1K files) → Package scope (50K) | ✅ |
 | Caps + .gitignore + always-skip dirs | ✅ |
