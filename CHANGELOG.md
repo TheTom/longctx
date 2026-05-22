@@ -1,5 +1,91 @@
 # Changelog
 
+## 0.4.1 — 2026-05-22
+
+Patch release. Adds four runaway-CPU protections to the live filesystem
+watcher and indexer pipeline shipped in 0.4.0. Triggered by a real
+incident: the v0.4.0 daemon spent ~29 hours at 121% CPU on MPS and
+~2 hours at 107% CPU on CPU device with no actual file activity in
+the indexed roots. Root cause: unfiltered FSEvent stream waking the
+Python event loop for every change under .git/, target/, etc.; once
+the daemon got into a hot loop, nothing throttled it.
+
+All four protections preserve the watcher's behavior (live re-indexing
+on real file changes). They cap the cost of the wrong cases.
+
+### 1. Pre-filter FSEvents at the watchfiles layer
+
+``Watcher`` now passes a ``_LongctxWatchFilter`` to ``wf.awatch(...)``.
+The filter runs in the watchfiles Rust layer before any Python wake-up.
+Directories whose basename matches any entry in
+``WatcherConfig.filter_ignore_dirs`` (default: ``.git``, ``.hg``,
+``.svn``, ``target``, ``build``, ``dist``, ``.build``, ``node_modules``,
+``bower_components``, ``__pycache__``, ``.pytest_cache``,
+``.ruff_cache``, ``.mypy_cache``, ``.venv``, ``venv``, ``env``,
+``.idea``, ``.vscode``, ``.next``, ``.svelte-kit``, ``.nuxt``,
+``criterion``, ``outputs``, ``.cache``, ``DerivedData``, ``.gradle``)
+never reach the watcher worker. Wake-ups drop to ~1% of unfiltered
+volume on typical dev directories.
+
+Configurable via ``WatcherConfig(filter_ignore_dirs=frozenset({...}))``
+override for repos with non-standard churn-prone dirs.
+
+### 2. Token-bucket rate limit on the embed worker
+
+``_TokenBucket`` in front of ``_apply_events``. Default 20 chunks/sec
+(``embed_chunks_per_second=20.0`` on CPU device). Even unfiltered floods
+get spread out over time instead of pinning a core. Bursts of up to
+the bucket capacity pass through instantly; sustained pressure smooths
+to the configured rate.
+
+Set ``embed_chunks_per_second=0`` to disable. MPS users can raise to
+200+ since GPU embedding throughput is higher.
+
+### 3. Self-throttle on sustained CPU
+
+The watcher samples its own process CPU once per minute via
+``psutil``. When ``cpu_percent_60s > self_throttle_cpu_pct``
+(default 70%), the embed rate halves automatically. When CPU drops
+back below 60% of the threshold, the baseline rate restores.
+Reversible, observable via daemon log lines.
+
+``psutil`` is optional; when unavailable the self-throttle no-ops
+and the other three protections still apply.
+
+### 4. SIGUSR2 → toggle watcher pause
+
+``kill -USR2 <pid>`` flips a module-level pause flag. The watcher's
+debounce worker checks ``watcher.is_paused()`` on every iteration
+and yields (still alive, just not consuming events). Sending USR2
+again resumes. FSEvent collection keeps running while paused; events
+queue up and process on resume.
+
+Use case: GPU benchmarks. ``kill -USR2 <pid>`` before the bench,
+``kill -USR2 <pid>`` after. No restart needed.
+
+### Belt-and-suspenders: ``os.nice(19)`` in ``detach_and_run``
+
+When ``serve --daemon`` detaches, the child process drops to
+nice=19 (lowest user priority). OS scheduler enforces that even
+a runaway daemon yields to any foreground process. Soft-fails on
+locked-down environments that disallow nice changes.
+
+### Tests
+
+* New ``tests/daemon/test_watcher_protections.py`` covers
+  ``_LongctxWatchFilter``, ``_TokenBucket`` (including the
+  n > burst case that hung the first implementation), and the
+  module-level pause flag toggle. 12 unit tests.
+* 890/890 daemon tests green (was 878 in 0.4.0 + 12 new).
+
+### Bug fix during implementation
+
+``_TokenBucket.acquire(n)`` initially looped forever when
+``n > burst`` because the burst cap re-clipped the refill on every
+iteration. Fixed by special-casing the over-burst path: wait the
+linear interval and let it through. Burst is now a rate-averaging
+parameter, not a strict bursting cap.
+
 ## 0.4.0 — 2026-05-22
 
 Minor release. Major new agent-side capabilities: ambient learning,

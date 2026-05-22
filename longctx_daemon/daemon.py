@@ -392,11 +392,29 @@ class Daemon:
         def _usr1(*_a) -> None:
             self.request_reindex()
 
+        def _usr2(*_a) -> None:
+            """SIGUSR2 toggles watcher pause / resume (v0.4.1).
+
+            Lets operators quiet the daemon mid-flight without a
+            restart (e.g., before a GPU benchmark). The watcher's
+            debounce worker checks ``watcher.is_paused()`` on every
+            loop iteration and yields when set. Per-project FS event
+            collection keeps running; events queue up until resume.
+            """
+            try:
+                from longctx_daemon import watcher as _w
+                _w.set_paused(not _w.is_paused())
+                state = "PAUSED" if _w.is_paused() else "RESUMED"
+                sys.stderr.write(f"[longctx daemon] watcher {state}\n")
+            except Exception:  # noqa: BLE001
+                pass
+
         for sig, handler in (
             (signal.SIGTERM, _term),
             (signal.SIGINT, _term),
             (getattr(signal, "SIGHUP", None), _hup),
             (getattr(signal, "SIGUSR1", None), _usr1),
+            (getattr(signal, "SIGUSR2", None), _usr2),
         ):
             if sig is None:
                 continue
@@ -506,6 +524,19 @@ def detach_and_run(run_fn: Callable[[], int], *, log_dir: Path) -> int:
         detach_process=True,
     )
     with ctx:
+        # v0.4.1: drop priority to nice=19 once detached. Daemon work
+        # (indexing, embedding, watcher) yields to anything else on
+        # the box. Critical for shared-CPU scenarios like GPU/CPU
+        # benchmarks running concurrently with the daemon. The OS
+        # scheduler enforces this — even a runaway worker loop
+        # cannot starve foreground processes.
+        try:
+            os.nice(19)
+        except OSError:
+            # Some POSIX environments disallow nice changes (e.g.,
+            # locked-down containers). Don't block startup; the
+            # in-process token bucket + filter still bound CPU.
+            pass
         rc = run_fn()
     return rc or 0
 

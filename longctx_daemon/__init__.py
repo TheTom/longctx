@@ -3,4 +3,4 @@
 Phase 2.0 surface: stdio MCP transport + structured trace logging.
 """
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"

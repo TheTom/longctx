@@ -147,6 +147,170 @@ class WatcherConfig:
     missing_root_grace_days: int = 7
     periodic_check_seconds: int = 3600
     cleanup_jitter_pct: float = 0.0
+    # v0.4.1 runaway-CPU protections (see §6.6 of the Ambient
+    # Indexing PRD and the CHANGELOG entry on this version). Wire-
+    # level FSEvent filtering — directories whose basename matches
+    # any of these are NEVER even surfaced to the watcher's worker
+    # loop. Saves wake-ups on .git internals, build outputs, etc.
+    # The filter runs at the watchfiles (Rust) layer before any
+    # Python wake-up. Critical because indexers DO filter at
+    # processing time, but the kernel event still wakes Python
+    # without this. Observed 2026-05-22: 107% sustained CPU with
+    # no actual file activity in the indexed roots — wake-ups on
+    # ignored paths were dominating.
+    filter_ignore_dirs: frozenset[str] = field(default_factory=lambda: frozenset({
+        ".git", ".hg", ".svn",
+        "target", "build", "dist", ".build",
+        "node_modules", "bower_components",
+        "__pycache__", ".pytest_cache", ".ruff_cache", ".mypy_cache",
+        ".venv", "venv", "env",
+        ".idea", ".vscode",
+        ".next", ".svelte-kit", ".nuxt",
+        "criterion", "outputs", ".cache",
+        "DerivedData", ".gradle",
+    }))
+    """Directory basenames that never reach the Python event loop.
+    Matched at the watchfiles filter layer (kernel-side on macOS
+    via FSEvents path filtering). Augment via WatcherConfig override
+    if your repos have additional churn-prone dirs."""
+    embed_chunks_per_second: float = 20.0
+    """Token-bucket cap on indexer.update_file calls per second. Default
+    20 is comfortable for CPU-device bge-small (~50-100 chunks/sec
+    native). MPS users can raise to 200+ via WatcherConfig override.
+    Set to 0 to disable rate limiting entirely."""
+    self_throttle_cpu_pct: float = 70.0
+    """Sustained CPU percentage above which the watcher halves its own
+    embed rate as a self-protection. Set to 0 to disable."""
+    self_throttle_window_seconds: int = 300
+    """Window over which CPU is averaged for the self-throttle decision.
+    Default 5 min keeps short-burst indexing work from tripping."""
+
+
+# --------------------------------------------------- runaway protections
+
+
+class _LongctxWatchFilter:
+    """watchfiles ``BaseFilter``-shaped filter that rejects paths under
+    any directory whose basename matches ``ignored_dirs``.
+
+    Built as a duck-typed callable rather than a hard import of
+    ``watchfiles.BaseFilter`` so this module stays import-cheap and
+    testable without the watchfiles package installed (tests pin to
+    the synthetic-event entry points).
+
+    The watchfiles Rust layer calls ``__call__(change, path)`` for
+    every raw event before it reaches Python's event loop. Returning
+    False drops the event at the kernel/Rust boundary — no Python
+    wake-up, no debounce work, no further filtering.
+    """
+
+    def __init__(self, ignore_dirs: frozenset[str]) -> None:
+        self._ignore_dirs = ignore_dirs
+
+    def __call__(self, change: Any, path: str) -> bool:
+        # Walk the path's parts; reject if any segment is in the
+        # ignored-dirs set. Cheap O(depth) check.
+        # Implementation note: avoid pathlib.Path() construction
+        # here because this runs on every FSEvent; raw split is
+        # ~10x faster.
+        sep = os.sep
+        for part in path.split(sep):
+            if part in self._ignore_dirs:
+                return False
+        return True
+
+
+class _TokenBucket:
+    """Simple token-bucket rate limiter for embed-worker calls.
+
+    Replenishes at ``tokens_per_second`` and blocks (via short async
+    sleep) when empty. Used to cap the rate at which the watcher's
+    debounce worker pushes ``update_file`` calls to the indexer.
+
+    Thread-safe-by-construction: only ever called from the watcher's
+    single asyncio worker loop, so no lock needed.
+
+    ``tokens_per_second == 0`` disables rate limiting entirely; the
+    bucket always reports ``acquire()`` succeeded immediately.
+    """
+
+    def __init__(self, tokens_per_second: float, burst: float = 10.0) -> None:
+        self._rate = max(0.0, float(tokens_per_second))
+        self._burst = max(1.0, float(burst))
+        self._tokens = self._burst
+        self._last_refill = time.monotonic()
+
+    async def acquire(self, n: float = 1.0) -> None:
+        """Block until ``n`` tokens are available.
+
+        Yields via ``asyncio.sleep`` so the event loop stays
+        responsive. Computes refill from real wall time so
+        bursts don't accumulate when the watcher is idle.
+
+        When ``n`` exceeds the burst cap (large coalesced batch),
+        we don't try to drain at burst-rate over multiple cycles
+        (that loops forever because the burst cap re-clips each
+        refill). Instead we wait the linear interval ``n / rate``
+        and let the request through. The bucket's purpose is rate-
+        averaging, not strict per-request bursting.
+        """
+        if self._rate <= 0.0:
+            return  # disabled
+        # Refill once up-front.
+        now = time.monotonic()
+        elapsed = now - self._last_refill
+        if elapsed > 0:
+            self._tokens = min(
+                self._burst, self._tokens + elapsed * self._rate,
+            )
+            self._last_refill = now
+        # Path 1: n fits within current tokens — instant.
+        if self._tokens >= n:
+            self._tokens -= n
+            return
+        # Path 2: n exceeds burst cap — wait the linear interval.
+        if n > self._burst:
+            wait = (n - self._tokens) / self._rate
+            await asyncio.sleep(max(0.01, wait))
+            # Refill is implicit: we've waited the right amount.
+            # Reset tokens to 0 since we just consumed n of them.
+            self._tokens = 0.0
+            self._last_refill = time.monotonic()
+            return
+        # Path 3: n is within burst — wait + small loop until tokens refilled.
+        wait = (n - self._tokens) / self._rate
+        await asyncio.sleep(max(0.01, wait))
+        now = time.monotonic()
+        elapsed = now - self._last_refill
+        self._tokens = min(self._burst, self._tokens + elapsed * self._rate)
+        self._last_refill = now
+        self._tokens = max(0.0, self._tokens - n)
+
+    def set_rate(self, tokens_per_second: float) -> None:
+        """Adjust the rate at runtime — used by the self-throttler
+        when it detects sustained high CPU."""
+        self._rate = max(0.0, float(tokens_per_second))
+
+
+# --------------------- pause + self-throttle module state
+
+# Global pause flag flipped by SIGUSR2 (pause) / SIGUSR1 (resume).
+# The watcher's debounce worker checks this on every loop iteration
+# and yields when set. Lives at module level so the cli signal
+# handler can flip it without holding a Watcher reference.
+_PAUSED: bool = False
+
+
+def set_paused(paused: bool) -> None:
+    """Toggle the module-level pause flag. Called by the cli signal
+    handlers (cli.py) so SIGUSR2 / SIGUSR1 take effect without a
+    daemon restart."""
+    global _PAUSED
+    _PAUSED = bool(paused)
+
+
+def is_paused() -> bool:
+    return _PAUSED
 
 
 # ------------------------------------------------------------------ helpers
@@ -239,6 +403,26 @@ class Watcher:
         self._indexer = indexer
         self._store = chunk_store
         self._cfg = config
+
+        # v0.4.1 runaway protections
+        self._rate_limiter = _TokenBucket(
+            tokens_per_second=config.embed_chunks_per_second,
+            burst=max(10.0, config.embed_chunks_per_second / 2),
+        )
+        self._watch_filter = _LongctxWatchFilter(config.filter_ignore_dirs)
+        # Self-throttle state: when sustained CPU exceeds threshold,
+        # halve the bucket rate. Re-check every minute. Reset to
+        # baseline when CPU drops back.
+        self._self_throttle_baseline = config.embed_chunks_per_second
+        self._self_throttle_active = False
+        self._last_throttle_check = 0.0
+        try:
+            import psutil  # type: ignore
+            self._proc = psutil.Process(os.getpid())
+            # Warm up cpu_percent() — first call returns 0.0.
+            self._proc.cpu_percent(interval=None)
+        except Exception:  # noqa: BLE001
+            self._proc = None
 
         self._states: dict[str, _ProjectState] = {}
         # Guards _states for cross-thread reads from sync API
@@ -575,6 +759,13 @@ class Watcher:
                     str(state.root_path),
                     stop_event=state.stop_event,
                     recursive=True,
+                    # v0.4.1: filter at the watchfiles layer (Rust)
+                    # so kernel FSEvents under .git/, target/,
+                    # __pycache__/, etc. never wake the Python event
+                    # loop. Avoids the runaway-CPU mode observed
+                    # 2026-05-22 where unfiltered wake-ups on busy
+                    # build/output dirs dominated daemon CPU.
+                    watch_filter=self._watch_filter,
                 ):
                     for change, raw_path in changes:
                         ev_type = self._map_change(change)
@@ -683,10 +874,27 @@ class Watcher:
         projects, then drains every project that's ready. Drain runs in
         a worker thread (``asyncio.to_thread``) so the indexer's SQLite
         + embed work doesn't block the event loop.
+
+        v0.4.1 protections live at the top of every iteration:
+          * If the module-level pause flag is set (SIGUSR2), the worker
+            yields without draining. Events accumulate in queues; the
+            watcher still observes them, just nothing reaches the
+            embedder. SIGUSR1 clears the flag.
+          * Self-throttle samples its own process CPU once per minute
+            and halves the embed rate when sustained above
+            ``self_throttle_cpu_pct`` for the configured window.
         """
         debounce = self._cfg.debounce_ms / 1000.0
         while True:
             try:
+                # Pause-flag check. When set, the worker stops consuming
+                # the queue but stays alive so a SIGUSR1 resume picks
+                # up immediately. The event-collection side (per-project
+                # awatch tasks) keeps running and enqueueing.
+                if is_paused():
+                    await asyncio.sleep(0.5)
+                    continue
+                self._maybe_self_throttle()
                 # Find earliest deadline.
                 with self._states_lock:
                     deadlines: list[float] = []
@@ -737,6 +945,52 @@ class Watcher:
                 # Avoid hot-looping on persistent failures.
                 await asyncio.sleep(0.1)
 
+    def _maybe_self_throttle(self) -> None:
+        """Sample own CPU and halve the embed rate on sustained > N%
+        for the configured window. Cheap — only samples once per
+        minute via the cached last-check timestamp.
+
+        v0.4.1 protection. Triggered when an event flood, indexer
+        bug, or runaway loop pegs a core. Throttling is reversible:
+        once CPU drops back below the threshold, the bucket rate
+        returns to the configured baseline.
+
+        ``psutil`` is optional. When unavailable the throttler is a
+        no-op (the rate-limit token bucket still works; this is just
+        the auto-half-it-if-stuck layer).
+        """
+        if self._proc is None or self._cfg.self_throttle_cpu_pct <= 0:
+            return
+        now = time.monotonic()
+        if now - self._last_throttle_check < 60.0:
+            return
+        self._last_throttle_check = now
+        try:
+            # psutil cpu_percent(interval=None) returns the average
+            # since the previous call. A 60-second sample window gives
+            # us the "is this thing eating a core" signal.
+            pct = self._proc.cpu_percent(interval=None)
+        except Exception:  # noqa: BLE001
+            return
+        threshold = self._cfg.self_throttle_cpu_pct
+        if pct > threshold and not self._self_throttle_active:
+            new_rate = max(1.0, self._self_throttle_baseline / 2.0)
+            self._rate_limiter.set_rate(new_rate)
+            self._self_throttle_active = True
+            logger.warning(
+                "watcher self-throttle ENGAGED — CPU %.1f%% > threshold %.0f%%; "
+                "embed rate halved to %.1f chunks/sec",
+                pct, threshold, new_rate,
+            )
+        elif pct < threshold * 0.6 and self._self_throttle_active:
+            self._rate_limiter.set_rate(self._self_throttle_baseline)
+            self._self_throttle_active = False
+            logger.info(
+                "watcher self-throttle RELEASED — CPU %.1f%% back to baseline; "
+                "embed rate restored to %.1f chunks/sec",
+                pct, self._self_throttle_baseline,
+            )
+
     async def _drain_now(self) -> None:
         """Drain every project whose debounce has expired (or that's
         flagged rescan_pending). Runs the per-project drain off-loop."""
@@ -769,6 +1023,12 @@ class Watcher:
             coalesced = self._coalesce_events(events)
             if not coalesced:
                 continue
+            # v0.4.1: rate-limit embedder calls. One token per event
+            # is the conservative accounting since most events expand
+            # to one update_file (which may produce N chunks but the
+            # bucket budget is per-call, not per-chunk; deeper
+            # accounting belongs in the indexer layer when it exists).
+            await self._rate_limiter.acquire(float(len(coalesced)))
             try:
                 await asyncio.to_thread(
                     self._apply_events, state.name, coalesced,
