@@ -1,7 +1,11 @@
 # longctx
 
-> **v0.3.1.** APIs are stable for v0.3.x; numbers and framing may still
-> tighten. Issues + PRs welcome. Apache-2.0.
+> **Maintenance notice (October 2026):** Longctx is preserved here for posterity
+> and is no longer maintained. The project has evolved into a second phase in
+> another repository. This version remains available under Apache-2.0 for you
+> to explore, fork, and build on, but expect some tinkering to get it working
+> with current dependencies and setups. The documentation and roadmap below
+> describe this historical version, not planned updates. Enjoy!
 
 **Open long-context retrieval for evaluations and live coding sessions.** One
 repo, three entry points:
@@ -208,9 +212,8 @@ upstream. Tradeoff vs the sidecar path: one extra HTTP hop per request and
 no engine-side ergonomics (no ``--enable-longctx`` flag).
 
 A proper integration would push the splice into the engine's prompt-build
-path so the engine owns scope detection + retrieval lifecycle. Open issue
-welcomed — see ``services/longctx-svc/integration/`` for the vllm-swift
-reference.
+path so the engine owns scope detection + retrieval lifecycle. See
+``services/longctx-svc/integration/`` for the historical vllm-swift reference.
 
 #### Fine-grained: hit ``/retrieve`` directly
 
